@@ -1,7 +1,7 @@
 ```{r plots}
 
 ########################################################################
-# All necessary libraries for project
+# Libraries
 ########################################################################
 library(ggplot2) # for plotting
 library(tidyverse) # for data manipulation and plotting
@@ -12,8 +12,9 @@ library(raster) # for raster data handling (some functions not in terra)
 library(rvest) # for web scraping
 library(fmesher) # for mesh construction
 library(INLA) # for INLA modeling
+
 ########################################################################
-# Necessary functions from data_prep.Rmd
+# Necessary functions from data_prep.Rmd to run plots
 ########################################################################
 
 colsc <- function(...) {
@@ -517,6 +518,7 @@ numerical_data_NOCROP("2023", "01", "15")
 ########################################################################
 # Compare Data from both Sources at Station Locations
 ########################################################################
+
 station_points <- st_transform(station_data("2023", "01", "15"), crs_km)  
 numerical_at_stations <- terra::extract(numerical_data("2023", "01", "15"), vect(station_points))
 
@@ -872,6 +874,7 @@ ggplot() +
 ########################################################################
 # Covariate Plots
 ########################################################################
+
 rast_elev_km <- readRDS("AA/rast_elev_km_centered.rds")
 rast_elevation_df <- as.data.frame(rast_elev_km_centered, xy = TRUE, na.rm = TRUE)
 rast_elevation_df$elev_km <- rast_elevation_df$elev_km_centered
@@ -1158,7 +1161,9 @@ plot_mesh()
 ########################################################################
 # Multiplicative Bias Plot
 ########################################################################
+
 res_df <- readRDS("AA/res_df_final_weighted.rds")
+
 # Plot the posterior weights for each value of b (multiplicative bias)
 plot(res_df$b, res_df$w, type = "b",
      xlab = expression(b),
@@ -1167,6 +1172,7 @@ plot(res_df$b, res_df$w, type = "b",
 ########################################################################
 # Predictions Plots
 ########################################################################
+
 # plot mean prediction for chosen model and year
 plot_mean <- function(field, title, yy){
   field_yy <- field %>% filter(year == yy)
@@ -1256,7 +1262,7 @@ plot_sd <- function(field, title, yy){
 
 yy <- 2008
 
-# reload predictions
+# reload predictions (from models.Rmd)
 station_predict <- readRDS("AA/station_predict_final.rds")
 numerical_predict <- readRDS("AA/numerical_predict_final.rds")
 fusion_predict <- readRDS("AA/fusion_predict_final.rds")
@@ -1652,8 +1658,7 @@ ggplot() +
   )
 ggsave(paste0("AA/numerical_vs_obs_stationloc_", yy, ".png"), width = 14, height = 14)
 
-
-# Plot station measurments against the predicted numerical model at the station locations. 
+# Plot station observations against the predicted numerical model at the station locations. 
 ggplot() +
   # new plot with three colors for three models so they are in values for legend
   geom_point(
@@ -1762,6 +1767,7 @@ ggsave(paste0("AA/training_compare_station_numerical_fusion_obs_", yy, ".png"), 
 ########################################################################
 # Cross validation study
 ########################################################################
+
 results <- readRDS("results_CV_ALL.rds")
 
 # Filter to only Stations and Fusion models
@@ -1955,7 +1961,6 @@ p3_training <- ggplot(results_training_clean, aes(x = year, y = CRPS, color = mo
     legend.text = element_text(size = 30)
   ) +
   scale_x_continuous(breaks = seq(2001, 2015, 2))
-
 
 # Display plots
 print(p1_training)
