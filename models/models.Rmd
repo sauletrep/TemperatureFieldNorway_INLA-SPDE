@@ -1,0 +1,606 @@
+```{r models}
+########################################################################
+# Librarys
+########################################################################
+
+library(terra) # for raster data handling
+library(raster) # for raster data handling (some functions not in terra)
+library(dplyr) # for data manipulation
+library(sf) # for spatial data handling
+library(fmesher) # for mesh construction
+library(INLA) # for INLA modeling
+library(inlabru) # for INLA modeling with SPDEs
+library(mgcv) # for INLA
+library(scoringRules) # for CRPS calculation
+bru_options_set(control.compute = list(dic = TRUE, waic  = TRUE), bru_verbose=1, verbose=FALSE) # for INLA options
+
+
+########################################################################
+# Open the data needed for the models (from data_prep.Rmd)
+########################################################################
+
+crs_km <- "+proj=utm +zone=33 +datum=WGS84 +units=km +no_defs"
+bnd_nor <- readRDS("AA/bnd_nor.rds")
+
+# Re-load data
+station_weatherdata <- readRDS("AA/station_all_01.01.rds")
+rast_testday_numerical <- readRDS("AA/numerical_all_01.01.rds")
+
+# Center time values
+years <- readRDS("AA/years.rds")
+mean_time <- mean(station_weatherdata$time)
+station_weatherdata$time <- station_weatherdata$time - mean_time
+rast_testday_numerical$time <- rast_testday_numerical$time - mean_time
+time_vals <- (1:length(years)) - mean_time   # centered time values used in model
+
+# Re-load data (already centered wrt time)
+training_station_weatherdata <- readRDS("AA/training_station_weatherdata_centered.rds")
+test_station_weatherdata <- readRDS("AA/test_station_weatherdata_centered.rds")
+numerical_model_data <- st_as_sf(rast_testday_numerical, coords = c("x", "y"), crs = crs_km)
+
+# Load the covariate rasters (saved in data_prep.Rmd, already centered)
+rast_elev_km_centered <- readRDS("AA/rast_elev_km_centered.rds")
+rast_lat_km_centered <- readRDS("AA/rast_lat_km_centered.rds")
+rast_long_km_centered <- readRDS("AA/rast_long_km_centered.rds")
+rast_waterdistance_km_centered <- readRDS("AA/rast_waterdistance_km_centered.rds")
+
+
+########################################################################
+# SPDE mesh
+########################################################################
+
+create_mesh <- function() {
+  # construct a mesh covering Norway (simple border)
+  # Add a larger mesh around to avoid boudary issues (large variance at edges)
+  mesh <- inla.mesh.2d(boundary=bnd_nor,
+                       max.edge=c(25, 80), # inner, outer lengths in km
+                       min.angle=c(30, 25), # minimum angles in triangles, smaller angles = more triangles
+                       max.n=c(48000, 16000), # maximum number of triangles, inner, outer
+                       max.n.strict=c(128000, 128000), # strict maximum number of triangles, inner, outer
+                       cutoff = 10, # minimum allowed distance between points on the mesh
+                       offset=c(75, 250),# inner, outer extension (the boundary) in km.
+                       crs = crs_km) 
+  # count nodes inside Norway
+  mesh_nodes_sf <- st_as_sf(
+    data.frame(mesh$loc),
+    coords = c(1, 2),
+    crs = st_crs(bnd_nor)
+  )
+
+  bnd_nor_union <- st_union(bnd_nor)
+  inside <- st_within(mesh_nodes_sf, bnd_nor_union, sparse = FALSE)
+  sum(inside)
+
+  # count number of mesh nodes in total
+  n_nodes <- nrow(mesh$loc) 
+  n_nodes
+  # count number of triangles
+  n_triangles <- nrow(mesh$graph$tv)
+  return(mesh)
+}
+
+matern_model <- function(model_mesh){
+  # Construct an SPDE model object for a Matern model:
+  matern_model <-
+    inla.spde2.pcmatern(model_mesh,
+      prior.sigma = c(3, 0.5), # P(sigma > 2) = 0.5 (weakly informative prior on marginal SD)
+      prior.range = c(100, 0.5), # P(range < 100 km) = 0.5
+      constr = FALSE #sum-to-zero constraint on the SPDE field explodes the range of the field
+                      # even though it avoids confounding between Intercept, field mean and b
+                        # its not worth it 
+    )
+}
+# Create Mesh and Matern Field
+mesh <- create_mesh()
+matern <- matern_model(mesh)
+
+saveRDS(mesh, file = "AA/mesh_final.rds")
+saveRDS(matern, file = "AA/matern_final.rds")
+
+########################################################################
+# Fit the stations-only model
+########################################################################
+cmp_stations = TG ~ -1 + 
+  intercept(1, prec.linear = 0.01) + # force the intercept to be closer to 0
+  lin_time(time, model = "linear") + # linear time effect (alpha_0*t)
+  rand_time(time, model = "iid") + # random time effect (alpha(t))
+  elevation(rast_elev_km_centered, model = "linear") +
+  latitude(rast_lat_km_centered, model = "linear") +
+  longitude(rast_long_km_centered, model = "linear") +
+  waterdistance(rast_waterdistance_km_centered, model = "linear") +
+  field(geometry, model = matern, replicate = time) # where time = 1, .... nr. years sentered
+
+fit_stations = bru(
+  components = cmp_stations,
+  data = station_weatherdata,
+  family = "Gaussian"
+)
+
+fit_stations_training = bru(
+  components = cmp_stations,
+  data = training_station_weatherdata,
+  family = "Gaussian"
+)
+
+########################################################################
+# Fit the regression calibration model
+########################################################################
+
+# Fit numerical model
+cmp_numerical = TG_num ~ -1 + 
+  intercept(1, prec.linear = 0.01) + # force the intercept to be closer to 0
+  lin_time(time, model = "linear") + # linear time effect (alpha_0*t)
+  rand_time(time, model = "iid") + # random time effect (alpha(t))
+  elevation(rast_elev_km_centered, model = "linear") +
+  latitude(rast_lat_km_centered, model = "linear") +
+  longitude(rast_long_km_centered, model = "linear") +
+  waterdistance(rast_waterdistance_km_centered, model = "linear") +
+  field(geometry, model = matern, replicate = time) # where time = 1, .... nr. years sentered
+
+
+fit_numerical = bru(
+  components = cmp_numerical,
+  data = numerical_model_data,
+  family = "Gaussian"
+)
+
+saveRDS(fit_stations, file = "AA/fit_stations_final.rds")
+saveRDS(fit_numerical, file = "AA/fit_numerical_final.rds")
+saveRDS(fit_stations_training, file = "AA/fit_stations_training.rds")
+
+########################################################################
+# Fit a series of data fusion models for a grid of candidate values for the multiplicative biases value (b)
+########################################################################
+
+# Model components
+cmp_fusion = ~ -1 + 
+  matern_error(main = geometry, model = matern) + # spatial additive bias, fixed in time
+  intercept(1, prec.linear = 0.01) + # force the intercept to be closer to 0
+  lin_time(time, model = "linear") + # linear time effect (alpha_0*t)
+  rand_time(time, model = "iid") + # random time effect (alpha(t))
+  elevation(rast_elev_km_centered, model = "linear") +
+  latitude(rast_lat_km_centered, model = "linear") +
+  longitude(rast_long_km_centered, model = "linear") +
+  waterdistance(rast_waterdistance_km_centered, model = "linear") +
+  field(geometry, model = matern, replicate = time) # where time = 1, .... nr. years sentered
+
+stations_fml = TG ~ intercept + lin_time + rand_time + elevation + latitude + longitude +
+  waterdistance + field
+
+stations_lik = bru_obs(
+  "Gaussian",
+  formula = stations_fml,
+  data = station_weatherdata
+)
+
+# Full model with fixed multiplicative bias to find best fit
+b_grid <- seq(0.5, 1.5, by = 0.1)
+
+b_results <- lapply(b_grid, function(b) {
+    numerical_fml_fixed = TG_num ~ matern_error + b * (
+        intercept + lin_time + rand_time + 
+        elevation + latitude + longitude + waterdistance + 
+        field)
+  
+    numerical_lik_fixed = bru_obs(
+        "Gaussian",
+        formula = numerical_fml_fixed,
+        data = numerical_model_data
+    )
+    
+    fit_res_fixed <- bru(
+        cmp_fusion, 
+        stations_lik, 
+        numerical_lik_fixed,
+        options = list(control.compute = list(mlik = TRUE))
+    )
+    
+    list(
+        b = b,
+        log_mlik = fit_res_fixed$mlik[1],
+        WAIC = fit_res_fixed$waic[[1]],
+        DIC = fit_res_fixed$dic[[1]]
+    )
+})
+
+# Combine results into a data frame
+res_df <- do.call(rbind, lapply(b_results, as.data.frame))
+saveRDS(res_df, file = "AA/res_df_final.rds")
+
+# Calculate posterior weights based on log marginal likelihoods
+res_df$w <- exp(res_df$log_mlik - max(res_df$log_mlik))
+res_df$w <- res_df$w / sum(res_df$w)
+
+saveRDS(res_df, file = "AA/res_df_final_weighted.rds")
+res_df <- readRDS("AA/res_df_final_weighted.rds")
+
+########################################################################
+# Fit the proposed data fusion model (full model with best multiplicative biases value (b = 0.7))
+########################################################################
+
+# b = 0.7 provides the best result
+b = 0.7
+numerical_fml = TG_num ~ matern_error + b * (intercept + lin_time + rand_time + elevation + latitude + longitude + waterdistance + field)
+
+numerical_lik = bru_obs(
+  "Gaussian",
+  formula = numerical_fml,
+  data = numerical_model_data
+)
+
+fit_res <- bru(
+  cmp_fusion, 
+  stations_lik, 
+  numerical_lik,
+  options = list(control.compute = list(mlik = TRUE))
+)
+
+stations_lik_training = bru_obs(
+  "Gaussian",
+  formula = stations_fml,
+  data = training_station_weatherdata
+)
+
+fit_res_training <- bru(
+  cmp_fusion, 
+  stations_lik_training, 
+  numerical_lik,
+  options = list(control.compute = list(mlik = TRUE))
+)
+
+saveRDS(fit_res, file = "AA/fit_res_final.rds")
+saveRDS(fit_res_training, file = "AA/fit_res_training_final.rds")
+
+########################################################################
+# Overview of all fitted models
+########################################################################
+
+# full mdoels
+fit_stations <- readRDS("AA/fit_stations_final.rds")
+fit_numerical <- readRDS("AA/fit_numerical_final.rds")
+fit_res <- readRDS("AA/fit_res_final.rds")
+
+# training models
+fit_stations_training <- readRDS("AA/fit_stations_training.rds")
+fit_res_training <- readRDS("AA/fit_res_training_final.rds")
+
+########################################################################
+# Prediction Function
+########################################################################
+
+# Creat a grid of locations
+pxl <- fm_pixels(mesh, mask = bnd_nor)
+st_crs(pxl) <- crs_km
+
+# Creat a seperate grid for each year
+px_list <- vector("list")
+idx <- 1
+for (iy in seq_along(years)) {
+  # each element in px_list is px_tmp, each px_tmp is the grid for the given year
+    #px_tmp incl geometry, year and time. 
+  px_tmp <- pxl
+  px_tmp$year  <- years[iy]
+  px_tmp$time  <- time_vals[iy]
+  px_list[[idx]] <- px_tmp
+  idx <- idx + 1
+}
+px_all <- do.call(rbind, px_list) # combine each element in the list (all the years)
+
+########################################################################
+# Predict all models (full models and training models)
+########################################################################
+
+station_field <- predict(
+  fit_stations,
+  px_all,
+  formula = ~ field
+)
+
+station_predict <- predict(
+  fit_stations,
+  px_all,
+  formula = ~ intercept + lin_time + rand_time + elevation + latitude + longitude + waterdistance + field
+)
+
+station_predict_training <- predict(
+  fit_stations_training,
+  px_all,
+  formula = ~ intercept + lin_time + rand_time + elevation + latitude + longitude + waterdistance + field
+)
+
+numerical_field <- predict(
+  fit_numerical,
+  px_all,
+  formula = ~ field
+)
+
+numerical_predict <- predict(
+  fit_numerical,
+  px_all,
+  formula = ~ intercept + lin_time + rand_time + elevation + latitude + longitude + waterdistance + field
+)
+
+fusion_field <- predict(
+  fit_res,
+  px_all,
+  formula = ~ field
+)
+
+fusion_bias <- predict(
+  fit_res,
+  px_all,
+  formula = ~ matern_error
+)
+
+fusion_predict <- predict(
+  fit_res,
+  px_all,
+  formula = ~ intercept + lin_time + rand_time + elevation + latitude + longitude + waterdistance + field
+)
+
+fusion_predict_training <- predict(
+  fit_res_training,
+  px_all,
+  formula = ~ intercept + lin_time + rand_time + elevation + latitude + longitude + waterdistance + field
+)
+
+saveRDS(station_field, file = "AA/station_field_final.rds")
+saveRDS(numerical_field, file = "AA/numerical_field_final.rds")
+saveRDS(fusion_field, file = "AA/fusion_field_final.rds")
+
+saveRDS(station_predict, file = "AA/station_predict_final.rds")
+saveRDS(numerical_predict, file = "AA/numerical_predict_final.rds")
+saveRDS(fusion_predict, file = "AA/fusion_predict_final.rds")
+
+saveRDS(station_predict_training, file = "AA/station_predict_training_final.rds")
+saveRDS(fusion_predict_training, file = "AA/fusion_predict_training_final.rds")
+
+saveRDS(fusion_bias, file = "AA/fusion_bias_final.rds")
+
+# reload predictions
+station_predict <- readRDS("AA/station_predict_final.rds")
+numerical_predict <- readRDS("AA/numerical_predict_final.rds")
+fusion_predict <- readRDS("AA/fusion_predict_final.rds")
+
+station_field <- readRDS("AA/station_field_final.rds")
+numerical_field <- readRDS("AA/numerical_field_final.rds")
+fusion_field <- readRDS("AA/fusion_field_final.rds")
+
+station_predict_training <- readRDS("AA/station_predict_training_final.rds")
+fusion_predict_training <- readRDS("AA/fusion_predict_training_final.rds")
+
+fusion_bias <- readRDS("AA/fusion_bias_final.rds")
+
+########################################################################
+# Cross validation study
+########################################################################
+
+lgocv_calculation <- function(fit_model){
+  fit_model$loocv <- inla.group.cv(fit_model, num.level.sets=-1)
+  fit_model$lgocv.m3 <- inla.group.cv(fit_model, num.level.sets=3)
+  fit_model$lgocv.m5 <- inla.group.cv(fit_model, num.level.sets=5)
+  fit_model$lgocv.m10 <- inla.group.cv(fit_model, num.level.sets=10)
+  return(fit_model)
+} # to read the vignette: vignette("AA-group-cv") in console
+
+# full final models
+fit_stations <- lgocv_calculation(fit_stations)
+fit_numerical <- lgocv_calculation(fit_numerical)
+fit_res <- lgocv_calculation(fit_res)
+
+saveRDS(fit_stations, file = "AA/fit_stations_final_LGOCV.rds")
+saveRDS(fit_numerical, file = "AA/fit_numerical_final_LGOCV.rds")
+saveRDS(fit_res, file = "AA/fit_res_final_LGOCV.rds")
+
+fit_stations <- readRDS("AA/fit_stations_final_LGOCV.rds")
+fit_numerical <- readRDS("AA/fit_numerical_final_LGOCV.rds")
+fit_res <- readRDS("AA/fit_res_final_LGOCV.rds")
+
+# $cv is a numeric vector representing the marginal log-predictive density for each test observation
+
+metrics_fit <- function(fit_given_CV){
+  years <- 2001:2015
+  # Calculate RMSPE and Log Score mean for each year 
+  metrics_by_year <- lapply(years, function(yy) { # lapply takes a list and applies a function to each element
+    idx <- which(station_weatherdata$year == yy)
+    
+    data.frame(
+      year = yy,
+      #length(fit_given_CV$mean[idx]) #126
+      #length(station_weatherdata$TG[idx]) #126
+      RMSPE = sqrt(mean((station_weatherdata$TG[idx] - fit_given_CV$mean[idx])^2, na.rm = TRUE)),
+        # RMSPE calculation is sqrt of mean squared error (root mean square prediction errors)
+      LS_mean = -mean(fit_given_CV$cv[idx], na.rm = TRUE),
+        # LS_mean calculation is log score mean, that is, the mean of the log score for each prediction (log score formula from Gneiting and Raftery, 2007)
+      # Calculate Continuous Ranked Probability Score
+      CRPS = mean(crps_norm(y = station_weatherdata$TG[idx], mean = fit_given_CV$mean[idx], sd = fit_given_CV$sd[idx]), na.rm = TRUE)
+    )
+  })
+  do.call(rbind, metrics_by_year)
+}
+
+# List of models and LGOCV folds
+models <- list(
+  "Stations"   = fit_stations,
+  "Numerical"  = fit_numerical,
+  "Fusion"     = fit_res
+)
+
+folds <- c("loocv", "lgocv.m3", "lgocv.m5", "lgocv.m10")
+
+# Initialise results table
+results <- data.frame(
+  Model = character(),
+  Fold  = character(),
+  RMSPE = numeric(),
+  LS_mean = numeric(),
+  CRPS = numeric(),
+  stringsAsFactors = FALSE
+)
+
+scores <- NULL
+# Loop through models and folds
+for(model_name in names(models)){
+  for(fold_name in folds){
+    cv_obj <- models[[model_name]][[fold_name]]
+    scores["RMSPE"] <- mean(metrics_fit(cv_obj)$"RMSPE")
+    scores["LS_mean"] <- mean(metrics_fit(cv_obj)$"LS_mean")
+    scores["CRPS"] <- mean(metrics_fit(cv_obj)$"CRPS")
+    results <- rbind(results, data.frame(
+      Model = model_name,
+      Fold  = fold_name,
+      RMSPE = scores["RMSPE"],
+      LS_mean = scores["LS_mean"],
+      CRPS = scores["CRPS"]
+    ))
+  }
+}
+
+# Show table
+print(results)
+saveRDS(results, file = "results_CV_ALL.rds")
+results <- readRDS("results_CV_ALL.rds")
+
+########################################################################
+# Manual Spatial Hold-Out Scheme 
+########################################################################
+
+# true values at station locations in test_station_weatherdata
+# output values from NORA3
+numerical_data <- rast_testday_numerical
+
+# calculate variance and sd for station, numerical and fusion training models
+var_stations_training <- 1 / (fit_stations_training$summary.hyperpar$mean[1])
+sd_stations_training <- sqrt(var_stations_training)
+
+var_num <- 1 / (fit_numerical$summary.hyperpar$mean[1])
+sd_num  <- sqrt(var_num)
+
+var_fusion_training <- 1 / (fit_res_training$summary.hyperpar$mean[1])
+sd_fusion_training <- sqrt(var_fusion_training)
+
+# Loop through years and calculate RMSPE and Log Score for each model at station locations in test_station_weatherdata
+years <- 2001:2015
+results_training <- data.frame(
+  year = integer(),
+  model = character(),
+  RMSPE = numeric(),
+  LS_mean = numeric(),
+  CRPS = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for(yy in years){
+  # Predict for the year
+  station_predict_training_yy <- station_predict_training %>% filter(year == yy)
+  numerical_predict_yy <- numerical_predict %>% filter(year == yy)
+  fusion_predict_training_yy <- fusion_predict_training %>% filter(year == yy)
+  test_station_weatherdata_yy <- test_station_weatherdata %>% filter(year == yy)
+  numerical_data_output_yy <- numerical_data %>% filter(year == yy)
+  
+  # Extract values at station locations in test_station_weatherdata from predicted station model
+  station_pred_stationloc_yy <- test_station_weatherdata_yy %>% 
+    st_join(station_predict_training_yy, join = st_nearest_feature)
+  
+  test_station_weatherdata_yy$TG_stations_training_predicted <- station_pred_stationloc_yy$mean
+  
+  # Extract values at station locations from predicted nuemrical model
+  numerical_pred_yy_stationloc <- test_station_weatherdata_yy %>% 
+    st_join(numerical_predict_yy, join = st_nearest_feature)
+  
+  test_station_weatherdata_yy$TG_num_predicted <- numerical_pred_yy_stationloc$mean
+  
+  # Extract values at station locations from predicted fusion model
+  fusion_pred_yy_stationloc <- test_station_weatherdata_yy  %>% 
+    st_join(fusion_predict_training_yy, join = st_nearest_feature)
+  
+  test_station_weatherdata_yy$TG_full_training_predicted <- fusion_pred_yy_stationloc$mean
+
+  # extract values at station location from NORA3 output
+  # first convert numerical_data to sf object
+  numerical_data_output_yy <- st_as_sf(numerical_data_output_yy, coords = c("x", "y"), crs = crs_km)
+
+  numerical_data_output_yy_stationloc <- test_station_weatherdata_yy  %>% 
+    st_join(numerical_data_output_yy, join = st_nearest_feature)
+
+  test_station_weatherdata_yy$TG_numerical_output <- numerical_data_output_yy_stationloc$TG_num
+  
+  # Calculate RMSPE and Log Score for each model
+  TG_true <- test_station_weatherdata_yy$TG
+  TG_predicted_station <- test_station_weatherdata_yy$TG_stations_training_predicted
+  TG_predicted_numerical <- test_station_weatherdata_yy$TG_num_predicted
+  TG_predicted_fusion <- test_station_weatherdata_yy$TG_full_training_predicted
+  TG_num_output <- test_station_weatherdata_yy$TG_numerical_output
+
+  RMSPE_station <- sqrt(mean((TG_true - TG_predicted_station)^2, na.rm = TRUE))
+  RMSPE_numerical <- sqrt(mean((TG_true - TG_predicted_numerical)^2, na.rm = TRUE))
+  RMSPE_fusion <- sqrt(mean((TG_true - TG_predicted_fusion)^2, na.rm = TRUE))
+  RMSPE_num_output <- sqrt(mean((TG_true - TG_num_output)^2, na.rm = TRUE))
+
+  # used to double check that the log score calculated using the dnorm function is the same as the log score calculated manually
+  #LS_station_manual <- -mean((1/2) * log(2 * pi * var_stations_training) + ((TG_true - TG_predicted_station)^2) / (2 * var_stations_training), na.rm = TRUE)
+  #LS_fusion_manual <- -mean((1/2) * log(2 * pi * var_fusion_training) + ((TG_true - TG_predicted_fusion)^2) / (2 * var_fusion_training), na.rm = TRUE)
+  
+  LS_station <- mean(dnorm(TG_true, mean = TG_predicted_station, sd = sd_stations_training, log = TRUE), na.rm = TRUE)
+  LS_numerical <- mean(dnorm(TG_true, mean = TG_predicted_numerical, sd = sd_num, log = TRUE), na.rm = TRUE)
+  LS_fusion <- mean(dnorm(TG_true, mean = TG_predicted_fusion, sd = sd_fusion_training, log  = TRUE), na.rm = TRUE)
+  LS_num_output <- 0 # not interested in log score for numerical output as it is not a probabilistic model
+
+  CRPS_station <- mean(crps_norm(y = TG_true, mean = TG_predicted_station, sd = sd_stations_training), na.rm = TRUE)
+  CRPS_numerical <- mean(crps_norm(y = TG_true, mean = TG_predicted_numerical, sd = sd_num), na.rm = TRUE)
+  CRPS_fusion <- mean(crps_norm(y = TG_true, mean = TG_predicted_fusion, sd = sd_fusion_training), na.rm = TRUE)
+  CRPS_num_output <- 0 # not interested in CRPS for numerical output as it is not a probabilistic model
+
+  # Append results to the data frame
+  results_training <- rbind(results_training, data.frame(
+    year = yy,
+    model = "Stations-only Training Model",
+    RMSPE = RMSPE_station,
+    LS_mean = LS_station,
+    CRPS = CRPS_station
+  ))
+  results_training <- rbind(results_training, data.frame(
+    year = yy,
+    model = "Numerical Model",
+    RMSPE = RMSPE_numerical,
+    LS_mean = LS_numerical,
+    CRPS = CRPS_numerical
+  ))
+  results_training <- rbind(results_training, data.frame(
+    year = yy,
+    model = "Fusion Training Model", 
+    RMSPE = RMSPE_fusion,
+    LS_mean = LS_fusion,
+    CRPS = CRPS_fusion
+  ))
+  results_training <- rbind(results_training, data.frame(
+    year = yy,
+    model = "NORA3 Output Model", 
+    RMSPE = RMSPE_num_output,
+    LS_mean = LS_num_output,
+    CRPS = CRPS_num_output
+  ))
+}
+
+results_training
+saveRDS(results_training, file = "AA/results_training.rds")
+results_training <- readRDS("AA/results_training.rds")
+# extract all station-only training model from results_training
+results_training_stations <- results_training  %>% filter(model == "Stations-only Training Model") 
+results_training_stations_RMSPE <- mean(results_training_stations$RMSPE)
+results_training_stations_LS_mean <- mean(results_training_stations$LS_mean)
+results_training_stations_crps <- mean(results_training_stations$CRPS)
+
+results_training_fusion <- results_training  %>% filter(model == "Fusion Training Model") 
+results_training_fusion_RMSPE <- mean(results_training_fusion$RMSPE)
+results_training_fusion_LS_mean <- mean(results_training_fusion$LS_mean)
+results_training_fusion_crps <- mean(results_training_fusion$CRPS)
+
+results_num <- results_training  %>% filter(model == "Numerical Model") 
+results_num_RMSPE <- mean(results_num$RMSPE)
+results_num_LS_mean <- mean(results_num$LS_mean)
+results_num_crps <- mean(results_num$CRPS)
+
+results_num_output <- results_training  %>% filter(model == "NORA3 Output Model") 
+results_num_output_RMSE <- mean(results_num_output$RMSPE)
+```
