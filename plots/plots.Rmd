@@ -1,0 +1,2018 @@
+```{r plots}
+
+########################################################################
+# All necessary libraries for project
+########################################################################
+library(ggplot2) # for plotting
+library(tidyverse) # for data manipulation and plotting
+library(dplyr) # for data manipulation
+library(sf) # for spatial data handling
+library(terra) # for raster data handling
+library(raster) # for raster data handling (some functions not in terra)
+library(rvest) # for web scraping
+library(fmesher) # for mesh construction
+library(INLA) # for INLA modeling
+########################################################################
+# Necessary functions from data_prep.Rmd
+########################################################################
+
+colsc <- function(...) {
+  scale_fill_gradientn(
+    colours = rev(RColorBrewer::brewer.pal(11, "RdYlBu")),
+    limits = range(..., na.rm = TRUE)
+  )
+}
+
+# color scale function, with terra colors
+colsc_TG_fill <- function(...) {
+  scale_fill_gradientn(
+    colours = rev(hcl.colors(100, "viridis")),
+    limits = range(..., na.rm = TRUE)
+  )
+}
+
+colsc_TG <- function(...) {
+  scale_color_gradientn(
+    colours = rev(hcl.colors(100, "viridis")),
+    limits = range(..., na.rm = TRUE)
+  )
+}
+
+all_rasters <- NULL  # will hold all daily layers of numerical data
+
+read_download_num_data <- function(start_year, end_year, start_month, end_month, start_day, end_day) {
+  # Mother function
+
+  # First check if data is already in all_rasters, don't need to do anything more if it is
+  if (!is.null(all_rasters)) {
+    test_name <- paste0("met_", start_year, start_month, start_day)
+    if (test_name %in% names(all_rasters)) {
+      return(NULL) # data already loaded
+    }
+  }
+  # use the read_html() from the rvest package to read the HTML content of the website
+  url_years <- "https://thredds.met.no/thredds/catalog/metppltcarchivev1/derived_products/daily_products/catalog.html"
+  
+  # read the html content
+  webpage_years <- read_html(url_years) # converts URL to a readable format in HTML
+  
+  # extract all years with data on the webpage
+  num_years <- html_nodes(webpage_years, "tr~ tr+ tr a tt") %>% html_text() %>% str_replace_all("/", "")
+  
+  #num_years <- read_num_years()
+  num_years <- num_years[num_years >= start_year & num_years <= end_year] # "2024", "2023", ...
+  
+  for (i in num_years) {
+    url_months <- paste0("https://thredds.met.no/thredds/catalog/metppltcarchivev1/derived_products/daily_products/", i, "/catalog.html")
+  
+    webpage_moths <- read_html(url_months)
+  
+    num_months <- html_nodes(webpage_moths, "tr~ tr+ tr a tt") %>% html_text() %>% str_replace_all("/", "")
+    #num_months <- read_num_months(i) # "12", "11", .. "01".
+    num_months <- num_months[num_months >= start_month & num_months <= end_month]
+    
+    for (j in num_months)  {
+      url_days <- paste0("https://thredds.met.no/thredds/catalog/metppltcarchivev1/derived_products/daily_products/", i, "/", j, "/catalog.html")
+  
+      webpage_days <- read_html(url_days)
+  
+      num_days <- html_nodes(webpage_days, "tr~ tr+ tr a tt") %>% html_text() %>% str_replace_all("/", "")
+
+      num_days <- rev(num_days)
+      #num_days <- rev(read_num_days(i, j)) # "01", "02", ..., "28" etc.
+      
+      days_numeric <- as.integer(num_days)
+      start_day_numeric <- as.integer(start_day)
+      end_day_numeric <- as.integer(end_day)
+      
+      num_days <- num_days[days_numeric >= start_day_numeric & days_numeric <= min(end_day_numeric, max(days_numeric))]
+      
+      for (k in num_days) {
+        # Build destination file name
+        destfile <- paste0("met_daily_datafiles/met_daily_", i, j, k,".nc")
+        
+        # Avoid downloading the same file multiple times 
+        if (!file.exists(destfile)) {
+          url_code <- paste0("https://thredds.met.no/thredds/catalog/metppltcarchivev1/derived_products/daily_products/", i, "/", j, "/", k, "/catalog.html")
+            
+          webpage_code <- read_html(url_code)
+          
+          yyyymmddcode <- html_nodes(webpage_code, "tr:nth-child(3) a tt") %>% html_text() # %>% str_replace_all("/", "")
+          
+          url_num_data <- paste0("https://thredds.met.no/thredds/fileServer/metppltcarchivev1/derived_products/daily_products/", i, "/", j, "/", k, "/", yyyymmddcode)
+          
+          # download to working directory
+          destfile <- paste0("met_daily_datafiles/met_daily_", i, j, k,".nc")
+          download.file(url_num_data, destfile = destfile, mode = "wb")
+        
+          # open with terra
+          SR_ijk <- rast(destfile) # SpatRaster format
+        
+          # Convert to km with correct crs
+          SR_ijk <- project(SR_ijk, crs_km)
+        
+          #SR_ijk <- download_num_data(i, j, k)
+        
+        } else {
+          SR_ijk <- rast(destfile)
+        }
+        
+        # handle fill values and outliers for old files
+        temp <- values(SR_ijk)
+        fill <- NA
+        if ("_FillValue" %in% names(attributes(SR_ijk[[1]]))) {
+          fill <- attr(SR_ijk[[1]], "_FillValue")
+          temp[temp == fill] <- NA
+        }
+        
+        temp[temp >= 100] <- NA # remove outliers 
+        values(SR_ijk) <- temp
+        
+        # Give each layer a meaningful name
+        names(SR_ijk) <- paste0("met_",i, j, k)
+
+        # Project on correct CRS and convert to km
+        if (crs(SR_ijk) != crs_km) {
+          SR_ijk <- project(SR_ijk, crs_km)
+        }
+
+        # add this day's raster as a new layer
+        if (is.null(all_rasters)) {
+          all_rasters <<- SR_ijk # using <<-updates global variable
+        } else {
+          all_rasters <<- c(all_rasters, SR_ijk)
+        }
+      }
+    }
+  }
+  return(SR_ijk)
+}
+
+numerical_data <- function(i, j, k){
+  test_name <- paste0("met_", i, j, k)
+
+  # Only download if the layer is NOT already in all_rasters
+  if (is.null(all_rasters) || !(test_name %in% names(all_rasters))) {
+    read_download_num_data(i, i, j, j, k, k)
+  }
+
+  chosen_testday <- all_rasters[[test_name]]
+
+  # convert raster to km properly (scale coordinates by 1000) incase it has not been already
+  chosen_testday_km <- terra::project(chosen_testday, crs_km)
+  
+  # crop first to reduce memory
+  chosen_testday_km <- terra::crop(chosen_testday_km, bnd_nor)
+  # mask to remove everything outside Norway
+  chosen_testday_km <- terra::mask(chosen_testday_km, bnd_nor)
+
+  chosen_testday_df <- as.data.frame(chosen_testday_km, xy = TRUE, na.rm = TRUE)
+
+  # Give the temperature column a fixed name
+  names(chosen_testday_df)[names(chosen_testday_df) == test_name] <- "temperature"
+
+  # Build title
+  ggtitle_chosen_day <- paste0("Numerical model temperature on ", k,".",j,".",i)
+
+  # Plot
+  p <- ggplot(chosen_testday_df) +
+    geom_raster(aes(x = x, y = y, fill = temperature)) +
+    colsc_TG_fill(chosen_testday_df$temperature) +
+    geom_path(
+      data = bnd_nor_xy,
+      aes(X, Y, group = group),
+      color = "grey",
+      linewidth = 0.6
+    ) +
+    coord_equal(
+      xlim = range(bnd_nor_xy$X),
+      ylim = range(bnd_nor_xy$Y),
+      expand = FALSE
+    ) +
+    theme_minimal() +
+    theme(
+        panel.grid.major = element_line(color = "grey80"),
+        panel.grid.minor = element_line(color = "grey90"),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        
+        plot.title = element_text(size = 29),
+        legend.text = element_text(size = 24),
+        legend.title = element_text(size = 29)
+    ) +
+    ggtitle(ggtitle_chosen_day) +
+    labs(
+      fill = "TG (°C)",
+      x = "x (km)",
+      y = "y (km)"
+    )
+  print(p)
+  
+  names(chosen_testday_km) <- "TG_num"
+  return(chosen_testday_km)
+}
+
+station_data <- function(i, j, k){
+  # First extract data in a dataframe for a given date
+  file_path <- paste0("weatherstationdata/unpacked/case_20250215/ngcd_v2503/", i, "/", j, "/", k, "/ngcd_case_TG_", i, j, k, ".txt") 
+  df <- read.table(file_path, header = TRUE, sep = "", stringsAsFactors = FALSE)
+
+  # correct the collums
+  df <- do.call(rbind, strsplit(as.character(df[[1]]), ";"))
+  df <- as.data.frame(df, stringsAsFactors = FALSE)
+  # the correct column names are: sourceId, lat, lon, elev, value, prid, dqc
+  correct_colnames <- colnames(df) 
+  # slit the correct column names by .
+  strsplit(correct_colnames, "\\.") # split by "."
+  # now replave V1, V2, etc with the correct column names and insert in df
+  df <- setNames(df, c("sourceId", "lat", "lon", "elev", "TG", "prid", "dqc"))
+
+  # convert the columns to the correct data types. 
+  df$lat <- as.numeric(df$lat)
+  df$lon <- as.numeric(df$lon)
+  df$elev <- as.numeric(df$elev)
+  df$TG <- as.numeric(df$TG) # temperature in celsius
+  df$prid <- as.integer(df$prid)
+  df$dqc <- as.integer(df$dqc)
+
+  # Now i want to see the TG observations at weather station locations
+  df_weatherdata <- df
+
+  # Convert the data frame to an sf object
+  sf_weatherdata <- sf::st_as_sf(df_weatherdata, coords = c("lon", "lat"), crs = 4326)
+
+  # the location is in degrees long/lat, need to convert to km and correct UTM
+  sf_weatherdata <- st_transform(sf_weatherdata, crs_km) 
+  weatherdata <- sf_weatherdata
+  # only keep the stations inside Norway
+  weatherdata <- sf_weatherdata[bnd_nor, ]
+
+  # rename elevation column to elev_km and scale to km
+  weatherdata <- weatherdata %>%
+    rename(elev_km = elev) %>%
+    mutate(elev_km = elev_km / 1000)
+  
+  # Extract coordinates
+  weatherdata_xy <- data.frame(
+    st_coordinates(weatherdata),
+    TG = weatherdata$TG
+  )
+
+  # Plot
+  p <- ggplot(weatherdata_xy) +
+      geom_polygon(
+        data = bnd_nor_xy,
+        aes(X, Y, group = group),
+        fill = "lightgrey",   # the fill color
+        color = "black",      # optional border
+        linewidth = 0.6
+      ) + 
+      geom_point(
+        aes(x = X, y = Y, color = TG),
+        size = 2
+      ) +
+      colsc_TG(weatherdata_xy$TG) +
+    coord_equal(
+      xlim = range(bnd_nor_xy$X),
+      ylim = range(bnd_nor_xy$Y),
+      expand = FALSE
+    ) +
+      theme_minimal() +
+      theme(
+        panel.grid.major = element_line(color = "grey80"),
+        panel.grid.minor = element_line(color = "grey90"),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        
+        plot.title = element_text(size = 29),
+        legend.text = element_text(size = 24),
+        legend.title = element_text(size = 29)
+      ) +
+      ggtitle(paste0("Observed values at weather stations on ", k,".", j,".", i)) +
+      labs(
+        color = "TG (°C)"
+      )
+  print(p)
+  return(weatherdata)
+}
+
+########################################################################
+# Open the data needed for the models (from data_prep.Rmd)
+########################################################################
+
+crs_km <- "+proj=utm +zone=33 +datum=WGS84 +units=km +no_defs"
+bnd_nor <- readRDS("AA/bnd_nor.rds")
+bnd_nor_xy <- readRDS("AA/bnd_nor_xy.rds")
+
+# Re-load data (already centered wrt time)
+station_weatherdata <- readRDS("AA/station_weatherdata_centered.rds")
+training_station_weatherdata <- readRDS("AA/training_station_weatherdata_centered.rds")
+test_station_weatherdata <- readRDS("AA/test_station_weatherdata_centered.rds")
+rast_testday_numerical <- readRDS("AA/rast_testday_numerical_centered.rds")
+numerical_model_data <- st_as_sf(rast_testday_numerical, coords = c("x", "y"), crs = crs_km)
+
+# Load the covariate rasters (saved in data_prep.Rmd, already centered)
+rast_elev_km_centered <- readRDS("AA/rast_elev_km_centered.rds")
+rast_lat_km_centered <- readRDS("AA/rast_lat_km_centered.rds")
+rast_long_km_centered <- readRDS("AA/rast_long_km_centered.rds")
+rast_waterdistance_km_centered <- readRDS("AA/rast_waterdistance_km_centered.rds")
+
+# also need time_vals and years (saved in data_prep.Rmd)
+years <- readRDS("AA/years.rds")
+mean_time <- readRDS("AA/mean_time.rds")
+time_vals <- readRDS("AA/time_vals.rds")
+
+########################################################################
+# Norwegian boundary polygon
+########################################################################
+
+# Plot Norwegian boundary polygon
+ggplot(bnd_nor_xy) +
+  geom_polygon(
+    aes(X, Y, group = group),
+    fill = "lightgrey",   # the fill color
+    color = "black",      # optional border
+    linewidth = 0.6
+  ) +
+  coord_equal(
+    xlim = range(bnd_nor_xy$X),
+    ylim = range(bnd_nor_xy$Y),
+    expand = FALSE
+  ) +
+  scale_x_continuous(breaks = seq(-500, 1500, by = 200)) +
+  scale_y_continuous(breaks = seq(5000, 9000, by = 200)) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_line(color = "grey90"),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.text = element_text(size = 17),
+    axis.title = element_text(size = 19),
+    plot.title = element_text(size = 29)
+  ) +
+  ggtitle("Norwegian boundary polygon")
+
+
+########################################################################
+# Numerical and Station Observation Data plots
+########################################################################
+
+# Numerical data and observations from weather stations for one day plots are within the functions station_data() and numerical_data()
+# they can be called with any date, but for our project we focus on 15 January 2023
+station_data("2023", "01", "15")
+numerical_data("2023", "01", "15")
+
+numerical_data_NOCROP <- function(i, j, k){
+  test_name <- paste0("met_", i, j, k)
+
+  # Only download if the layer is NOT already in all_rasters
+  if (is.null(all_rasters) || !(test_name %in% names(all_rasters))) {
+    read_download_num_data(i, i, j, j, k, k)
+  }
+
+  chosen_testday <- all_rasters[[test_name]]
+
+  # convert raster to km properly (scale coordinates by 1000) incase it has not been already
+  chosen_testday_km <- terra::project(chosen_testday, crs_km)
+
+  chosen_testday_df <- as.data.frame(chosen_testday_km, xy = TRUE, na.rm = TRUE)
+
+  # Give the temperature column a fixed name
+  names(chosen_testday_df)[names(chosen_testday_df) == test_name] <- "temperature"
+
+  # Build title
+  ggtitle_chosen_day <- paste0("Numerical model temperature on ", k,".",j,".",i)
+
+  # Plot
+  p <- ggplot(chosen_testday_df) +
+    geom_raster(aes(x = x, y = y, fill = temperature)) +
+    colsc_TG_fill(chosen_testday_df$temperature) +
+    geom_path(
+      data = bnd_nor_xy,
+      aes(X, Y, group = group),
+      color = "grey",
+      linewidth = 0.6
+    ) +
+    coord_equal(
+      xlim = range(chosen_testday_df$x),
+      ylim = range(chosen_testday_df$y),
+      expand = FALSE
+    ) +
+    theme_minimal() +
+    theme(
+        panel.grid.major = element_line(color = "grey80"),
+        panel.grid.minor = element_line(color = "grey90"),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        
+        plot.title = element_text(size = 29),
+        legend.text = element_text(size = 24),
+        legend.title = element_text(size = 29)
+    ) +
+    ggtitle(ggtitle_chosen_day) +
+    labs(
+      fill = "TG (°C)",
+      x = "x (km)",
+      y = "y (km)"
+    )
+  print(p)
+  
+  names(chosen_testday_km) <- "TG_num"
+  return(chosen_testday_km)
+}
+
+station_data_NOCROP <- function(i, j, k){
+  # First extract data in a dataframe for a given date
+  file_path <- paste0("weatherstationdata/unpacked/case_20250215/ngcd_v2503/", i, "/", j, "/", k, "/ngcd_case_TG_", i, j, k, ".txt") 
+  df <- read.table(file_path, header = TRUE, sep = "", stringsAsFactors = FALSE)
+
+  # correct the collums
+  df <- do.call(rbind, strsplit(as.character(df[[1]]), ";"))
+  df <- as.data.frame(df, stringsAsFactors = FALSE)
+  # the correct column names are: sourceId, lat, lon, elev, value, prid, dqc
+  correct_colnames <- colnames(df) 
+  # slit the correct column names by .
+  strsplit(correct_colnames, "\\.") # split by "."
+  # now replave V1, V2, etc with the correct column names and insert in df
+  df <- setNames(df, c("sourceId", "lat", "lon", "elev", "TG", "prid", "dqc"))
+
+  # convert the columns to the correct data types. 
+  df$lat <- as.numeric(df$lat)
+  df$lon <- as.numeric(df$lon)
+  df$elev <- as.numeric(df$elev)
+  df$TG <- as.numeric(df$TG) # temperature in celsius
+  df$prid <- as.integer(df$prid)
+  df$dqc <- as.integer(df$dqc)
+
+  # Now i want to see the TG observations at weather station locations
+  df_weatherdata <- df
+
+  # Convert the data frame to an sf object
+  sf_weatherdata <- sf::st_as_sf(df_weatherdata, coords = c("lon", "lat"), crs = 4326)
+
+  # the location is in degrees long/lat, need to convert to km and correct UTM
+  sf_weatherdata <- st_transform(sf_weatherdata, crs_km) 
+  weatherdata <- sf_weatherdata
+
+  # rename elevation column to elev_km and scale to km
+  weatherdata <- weatherdata %>%
+    rename(elev_km = elev) %>%
+    mutate(elev_km = elev_km / 1000)
+  
+  # Extract coordinates
+  weatherdata_xy <- data.frame(
+    st_coordinates(weatherdata),
+    TG = weatherdata$TG
+  )
+
+  # Plot
+  p <- ggplot(weatherdata_xy) +
+      geom_polygon(
+        data = bnd_nor_xy,
+        aes(X, Y, group = group),
+        fill = "lightgrey",   # the fill color
+        color = "black",      # optional border
+        linewidth = 0.6
+      ) + 
+      geom_point(
+        aes(x = X, y = Y, color = TG),
+        size = 2
+      ) +
+      colsc_TG(weatherdata_xy$TG) +
+    coord_equal(
+      xlim = range(weatherdata_xy$X),
+      ylim = range(weatherdata_xy$Y),
+      expand = FALSE
+    ) +
+      theme_minimal() +
+      theme(
+        panel.grid.major = element_line(color = "grey80"),
+        panel.grid.minor = element_line(color = "grey90"),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        
+        plot.title = element_text(size = 29),
+        legend.text = element_text(size = 24),
+        legend.title = element_text(size = 29)
+      ) +
+      ggtitle(paste0("Observed values at weather stations on ", k,".", j,".", i)) +
+      labs(
+        color = "TG (°C)"
+      )
+  print(p)
+  return(weatherdata)
+}
+station_data_NOCROP("2023", "01", "15")
+numerical_data_NOCROP("2023", "01", "15")
+
+########################################################################
+# Compare Data from both Sources at Station Locations
+########################################################################
+station_points <- st_transform(station_data("2023", "01", "15"), crs_km)  
+numerical_at_stations <- terra::extract(numerical_data("2023", "01", "15"), vect(station_points))
+
+comparison_df <- data.frame(
+  station_TG = station_points$TG,
+  numerical_TG = numerical_at_stations$TG_num
+)
+
+# Plot Comparison
+ggplot(comparison_df, aes(x = numerical_TG, y = station_TG)) +
+  geom_point(color = "blue", size = 2) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  theme_minimal() +
+  labs(
+    title = "Comparison of Station and Numerical Data Temp.",
+    x = "Numerical Model Temperature (°C)",
+    y = "Station Temperature (°C)"
+  ) +
+  # add legend to plot representing points "blue point are temperature at stations"
+  scale_x_continuous(breaks = seq(-20, 10, by = 5)) +
+  scale_y_continuous(breaks = seq(-35, 10, by = 5)) +
+  theme(
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_line(color = "grey90"),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    
+    plot.title = element_text(size = 29),
+    axis.title = element_text(size = 29),
+    axis.text = element_text(size = 24),
+    legend.text = element_text(size = 17),
+    legend.title = element_text(size = 19)
+  ) +
+  xlim(min(comparison_df$numerical_TG, na.rm = TRUE), max(comparison_df$numerical_TG, na.rm = TRUE)) +
+  ylim(min(comparison_df$station_TG, na.rm = TRUE), max(comparison_df$station_TG, na.rm = TRUE))
+
+########################################################################
+# Station observation data plots
+########################################################################
+
+collect_weather_data <- function(year, month, day) {
+  # returns data in a dataframe for a given date
+  file_path <- paste0("weatherstationdata/unpacked/case_20250215/ngcd_v2503/", year, "/", month, "/", day, "/ngcd_case_TG_", year, month, day, ".txt") 
+  df <- read.table(file_path, header = TRUE, sep = "", stringsAsFactors = FALSE)
+
+  # correct the collums
+  df <- do.call(rbind, strsplit(as.character(df[[1]]), ";"))
+  df <- as.data.frame(df, stringsAsFactors = FALSE)
+  # the correct column names are: sourceId, lat, lon, elev, value, prid, dqc
+  correct_colnames <- colnames(df) 
+  # slit the correct column names by .
+  strsplit(correct_colnames, "\\.") # split by "."
+  # now replave V1, V2, etc with the correct column names and insert in df
+  df <- setNames(df, c("sourceId", "lat", "lon", "elev", "TG", "prid", "dqc"))
+
+  # convert the columns to the correct data types. 
+  df$lat <- as.numeric(df$lat)
+  df$lon <- as.numeric(df$lon)
+  df$elev <- as.numeric(df$elev)
+  df$TG <- as.numeric(df$TG) # temperature in celsius
+  df$prid <- as.integer(df$prid)
+  df$dqc <- as.integer(df$dqc)
+
+  return(df)
+}
+
+# Open and formate station observation data for every day
+station_raster <- NULL
+# --- OBS! SLOW CODE -----
+for (yr in 1971:2025){
+  for (my in 1:12){
+    for (dy in 1:31){
+      mm <- sprintf("%02d", my)
+      dd <- sprintf("%02d", dy)
+      # check if the day is valid (e.g., not February 30). Check by cheking if file exists:
+      if (file.exists(paste0("weatherstationdata/unpacked/case_20250215/ngcd_v2503/", yr, "/", mm, "/", dd, "/ngcd_case_TG_", yr, mm, dd, ".txt"))){
+        station_data <- collect_weather_data(as.character(yr), mm, dd)
+
+        # crop to norway with bnd_nor
+        sf_station_data <- sf::st_as_sf(station_data, coords = c("lon", "lat"), crs = 4326)
+        sf_station_data <- st_transform(sf_station_data, crs_km) 
+        sf_station_data <- sf_station_data[bnd_nor, ]
+
+        # count number of rows in station_data
+        num_stations <- nrow(sf_station_data)
+        # add each count seperatly as a line in a raster with number of stations and data as ID
+        station_raster <- rbind(station_raster, data.frame(year = yr, month = mm, day = dd, num_stations = num_stations))
+      } else {
+        next
+      }
+
+    }
+  }
+}
+
+# download station raster count data (station_raster) to machine since it takes so long to run all years
+write.csv(station_raster, "AA/station_raster_count_data.csv", row.names = FALSE)
+
+# load station raster count data from machine
+test_station_raster <- read.csv("AA/station_raster_count_data.csv")
+
+# exclude 2025
+station_raster_61_24 <- test_station_raster %>%
+  filter(year < 2025)
+
+# plot histogram of number of stations per day
+ggplot(station_raster_61_24, aes(x = num_stations)) +
+  geom_histogram(binwidth = 10, fill = "lightblue", color = "black") +
+  labs(title = "Number of Weather Stations Reporting Daily Mean (1961-2024)",
+       x = "Number of Reporting Weather Stations",
+       y = "Frequency") +
+  theme_minimal()
+
+# now merge all counts for each year to see how many stations per year in avarage
+station_raster_yearly <- station_raster_61_24 %>%
+  group_by(year) %>%
+  summarise(total_stations = mean(num_stations))
+
+# plot number of stations per year, make all text larger (axsis, title, number along axis)
+ggplot(station_raster_yearly, aes(x = year, y = total_stations)) +
+  geom_line(color = "blue") +
+  geom_point(color = "red") +
+  labs(title = "Average Nr. of Reporting Stations per Day (1961-2024)",
+       x = "Year",
+       y = "Reporting Weather Stations") +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 24),
+    axis.title = element_text(size = 29),
+    plot.title = element_text(size = 29, hjust = 0.5)
+  )
+
+# Now plot histogram of number of stations per day for only january 2025
+station_raster_jan2024 <- test_station_raster %>%
+  filter(year == 2024 & month == 01)
+
+# Plot how many stations per day in january 2024
+ggplot(station_raster_jan2024, aes(x = as.integer(day), y = num_stations)) +
+  geom_line(color = "purple") +
+  geom_point(color = "orange") +
+  labs(title = "Number of Reporting Weather Stations in January 2024",
+       x = "Day of January 2024",
+       y = "Number of Reporting Weather Stations") +
+  theme_minimal()+
+  theme(
+    axis.text = element_text(size = 24),
+    axis.title = element_text(size = 29),
+    plot.title = element_text(size = 29, hjust = 0.5)
+  )
+
+# Now plot how many stations per day in january but for 2020, 2021, 2022, 2023 adn 2024
+station_raster_jan_all <- test_station_raster %>%
+  filter(month == 01 & year >= 2020 & year <= 2024)
+
+#plot in cronological order
+ggplot(station_raster_jan_all, aes(x = as.integer(day), y = num_stations, color = as.factor(year))) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Number of Reporting Stations, January (2020-2024)",
+       x = "Day",
+       y = "Nr. of Reporting Weather Stations",
+       color = "Year") +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 24),
+    axis.title = element_text(size = 29),
+    plot.title = element_text(size = 29, hjust = 0.5),
+    legend.text = element_text(size = 24),
+    legend.title = element_text(size = 29)
+  )
+
+format_weather_data <- function(i, j, k){
+  # Now i want to see the TG observations at weather station locations
+
+  df_weatherdata <- collect_weather_data(i, j, k)
+
+  # Convert the data frame to an sf object
+  sf_weatherdata <- sf::st_as_sf(df_weatherdata, coords = c("lon", "lat"), crs = 4326)
+
+  # the location is in degrees long/lat, need to convert to km and correct UTM
+  sf_weatherdata <- st_transform(sf_weatherdata, crs_km) 
+  weatherdata <- sf_weatherdata
+  # only keep the stations inside Norway
+  weatherdata <- sf_weatherdata[bnd_nor, ]
+
+  # rename elevation column to elev_km and scale to km
+  weatherdata <- weatherdata %>%
+    rename(elev_km = elev) %>%
+    mutate(elev_km = elev_km / 1000)
+
+  return(weatherdata)
+}
+
+# Calculate the distance between stations for january 1st 2020
+station_data_20200101 <- format_weather_data("2020", "01", "01")
+station_coords_20200101 <- st_coordinates(station_data_20200101)
+dist_matrix_20200101 <- as.matrix(dist(station_coords_20200101))
+# Get the minimum distance for each station
+min_distances_20200101 <- apply(dist_matrix_20200101 + diag(Inf, nrow(dist_matrix_20200101)), 1, min)
+# summary of minimum distances
+summary(min_distances_20200101)
+
+# Count how many stations are in the north of Norway
+stations_north <- station_data_20200101 %>%
+  filter(st_coordinates(.)[,2] > 7230)
+
+ggplot() +
+    geom_sf(data = bnd_nor, fill = "lightgrey") +
+    geom_sf(data = stations_north, aes(color = TG), size = 2) +
+    colsc_TG(stations_north$TG) +
+    coord_sf() +
+    ggtitle(paste0("Observed values at weather stations north of 7230 km on 01.01.2020"))
+
+# Calculate the distance between stations for january 1st 2020 in north of Norway
+station_coords_north <- st_coordinates(stations_north)
+dist_matrix_north <- as.matrix(dist(station_coords_north))
+# Get the minimum distance for each station
+min_distances_north <- apply(dist_matrix_north + diag(Inf, nrow(dist_matrix_north)), 1, min)
+# summary of minimum distances
+summary(min_distances_north)
+
+# Count how many stations are in the north of Norway
+stations_south <- station_data_20200101 %>%
+  filter(st_coordinates(.)[,2] <= 7230)
+
+# Calculate the distance between stations for january 1st 2020 in south of Norway
+station_coords_south <- st_coordinates(stations_south)
+dist_matrix_south <- as.matrix(dist(station_coords_south))
+# Get the minimum distance for each station
+min_distances_south <- apply(dist_matrix_south + diag(Inf, nrow(dist_matrix_south)), 1, min)
+# summary of minimum distances
+summary(min_distances_south)
+
+# plot them together but with different colors for south and north
+par(xaxs = "i", yaxs = "i")
+par(mar = c(5, 5, 4, 2) + 0.1)   # standard margins
+hist(min_distances_north, breaks = 30, col = rgb(1, 0, 0, 0.5), xlim = c(0, 70), ylim = c(0, 80), main = "Minimum Distance Between Stations (01.01.2020)", xlab = "Minimum Distance (km)", cex.main = 2.5, cex.lab = 2.2, cex.axis = 2)
+hist(min_distances_south, breaks = 30, col = rgb(0, 0, 1, 0.5), add = TRUE)
+legend("topright", legend = c("North", "South"), fill = c(rgb(1, 0, 0, 0.5), rgb(0, 0, 1, 0.5)), cex = 2.5)
+
+# plot histogram of elevation of stations on 2020-01-01
+par(xaxs = "i", yaxs = "i")
+hist(station_data_20200101$elev_km, breaks = 20, xlim = c(0, 2), ylim = c(0, 200), main = "Station Elevations (01.01.2020)", xlab = "Elevation (km)", cex.main = 2.5, cex.lab = 2.2, cex.axis = 2)
+
+# count how many stations are below 0.46 km elevation
+stations_below_046km <- station_data_20200101 %>%
+  filter(elev_km < 0.46)
+nrow(stations_below_046km)
+station_above_046km <- station_data_20200101 %>%
+  filter(elev_km >= 0.46)
+nrow(station_above_046km)
+nrow(station_data_20200101)
+
+# calculate mean elevation of all station on 2020-01-01
+mean_elevation_20200101 <- mean(station_data_20200101$elev_km)
+mean_elevation_20200101
+
+# calculate median elevation of all station on 2020-01-01
+median_elevation_20200101 <- median(station_data_20200101$elev_km)
+median_elevation_20200101
+
+########################################################################
+# Test, Training and Validation Stations
+########################################################################
+
+# Plot the locations of the test stations on the map of Norway
+ggplot() +
+  geom_polygon(
+    data = bnd_nor_xy,
+    aes(X, Y, group = group),
+    fill = "lightgrey",
+    color = "black",
+    linewidth = 0.6
+  ) +
+  geom_point(data = test_station_weatherdata, 
+             aes(x = st_coordinates(test_station_weatherdata)[,1], 
+                 y = st_coordinates(test_station_weatherdata)[,2],
+                 color = sourceId),
+             size = 3) +
+  #scale_color_manual(values = station_colors, name = "Station ID") +
+  coord_equal(
+    xlim = range(bnd_nor_xy$X, na.rm = TRUE),
+    ylim = range(bnd_nor_xy$Y, na.rm = TRUE),
+    expand = FALSE
+  ) +
+  scale_x_continuous(breaks = seq(-500, 1500, by = 200)) +
+  scale_y_continuous(breaks = seq(5000, 9000, by = 200)) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_line(color = "grey90"),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_blank(),
+    
+    plot.title = element_text(size = 29),
+    axis.title =element_blank(),
+    axis.text = element_blank(),
+    legend.text = element_text(size = 17),
+    legend.title = element_text(size = 22)
+  ) +
+  ggtitle("Location of Chosen Weather Stations")
+
+removed_station_weatherdata <- readRDS("AA/removed_station_weatherdata_centered.rds")
+
+# plot geometries in different colors (training_station_weatherdata = blue, removed_station_weatherdata = green, test_station_weatherdata = red)
+ggplot() +
+  geom_polygon(
+    data = bnd_nor_xy,
+    aes(X, Y, group = group),
+    fill = "lightgrey",
+    color = "black",
+    linewidth = 0.6
+  ) +
+  geom_point(data = training_station_weatherdata, 
+             aes(x = st_coordinates(training_station_weatherdata)[,1], 
+                 y = st_coordinates(training_station_weatherdata)[,2],
+                 color = "Training Data"),
+             size = 2) +
+  geom_point(data = removed_station_weatherdata, 
+             aes(x = st_coordinates(removed_station_weatherdata)[,1], 
+                 y = st_coordinates(removed_station_weatherdata)[,2],
+                 color = "Removed Data"),
+             size = 2) +
+  geom_point(data = test_station_weatherdata, 
+             aes(x = st_coordinates(test_station_weatherdata)[,1], 
+                 y = st_coordinates(test_station_weatherdata)[,2],
+                 color = "Test Data"),
+             size = 3) +
+  coord_equal(
+    xlim = range(bnd_nor_xy$X),
+    ylim = range(bnd_nor_xy$Y),
+    expand = FALSE
+  ) +
+  theme_minimal() +
+  # add legend explaining colors of stations plotted
+  scale_color_manual(values = c("Training Data" = "blue", "Removed Data" = "green", "Test Data" = "red")) +
+  theme(
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_line(color = "grey90"),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_blank(),
+    
+    plot.title = element_text(size = 24),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    legend.text = element_text(size = 20),
+    legend.title = element_text(size = 24)
+  ) +
+  ggtitle("Training Data, Test Data and Removed Data") +
+  # add legend title
+  labs(color = "Station Type")
+
+########################################################################
+# Covariate Plots
+########################################################################
+rast_elev_km <- readRDS("AA/rast_elev_km_centered.rds")
+rast_elevation_df <- as.data.frame(rast_elev_km_centered, xy = TRUE, na.rm = TRUE)
+rast_elevation_df$elev_km <- rast_elevation_df$elev_km_centered
+
+# Plot
+ggplot(rast_elevation_df) +
+    geom_raster(aes(x = x, y = y, fill = elev_km)) +
+    colsc_TG_fill(rast_elevation_df$elev_km) +
+    geom_path(
+        data = bnd_nor_xy,
+        aes(X, Y, group = group),
+        color = "grey",
+        linewidth = 0.6
+    ) +
+    coord_equal(
+        xlim = range(rast_elevation_df$x),
+        ylim = range(rast_elevation_df$y),
+        expand = FALSE
+    ) +
+    theme_minimal() +
+    theme(
+        panel.grid.major = element_line(color = "grey80"),
+        panel.grid.minor = element_line(color = "grey90"),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        
+        plot.title = element_text(size = 29),
+        legend.text = element_text(size = 22),
+        legend.title = element_text(size = 29)
+    ) +
+    ggtitle("Elevation in km") +
+    labs(
+        fill = "Elevation (km)"
+    )
+
+# Plots for distance to different bodys of water are within the function that creates those covariates
+
+########################################################################
+# Check for spatial bias 
+########################################################################
+
+station_all <- readRDS("AA/station_all_jan_days_2001.rds")
+comparison_numerical_df <- readRDS("AA/comparison_numerical_jan_days_2001.rds")
+
+# sort comparison_numerical_df by station_Id to check data
+comparison_numerical_df <- comparison_numerical_df %>%
+  arrange(sourceId)
+
+station_weatherdata_check <- station_all
+
+stations_north <- station_weatherdata_check %>%
+  filter(st_coordinates(.)[,2] > 7230)
+
+stations_south <- station_weatherdata_check %>%
+  filter(st_coordinates(.)[,2] < 7230)
+
+stations_high <- station_weatherdata_check %>%
+  filter(elev_km > 0.46)
+
+stations_low <- station_weatherdata_check %>%
+  filter(elev_km <= 0.46)
+
+# Chooe stations to plot based on location and elevation, and extract the station and numerical data for those stations
+station_METSN97350 <- station_weatherdata_check %>%
+  filter(sourceId == "METSN97350:0")
+numerical_METSN97350 <- comparison_numerical_df %>%
+  filter(sourceId == "METSN97350:0")
+
+station_METSN88000 <- station_weatherdata_check %>%
+  filter(sourceId == "METSN88000:0") 
+numerical_METSN88000 <- comparison_numerical_df %>%
+  filter(sourceId == "METSN88000:0")
+
+station_METSN52290 <- station_weatherdata_check %>%
+  filter(sourceId == "METSN52290:0")
+numerical_METSN52290 <- comparison_numerical_df %>%
+  filter(sourceId == "METSN52290:0")
+
+station_METSN46510 <- station_weatherdata_check %>%
+  filter(sourceId == "METSN46510:0")
+numerical_METSN46510 <- comparison_numerical_df %>%
+  filter(sourceId == "METSN46510:0")
+
+# Extract coordinates
+station_weatherdata_xy <- data.frame(
+  st_coordinates(station_weatherdata_check),
+  TG = station_weatherdata_check$TG
+)
+
+# First, create a dataframe combining all selected stations
+stations_plot_data <- rbind(
+  station_METSN97350,
+  station_METSN88000,
+  station_METSN52290,
+  station_METSN46510
+) %>%
+  mutate(station_name = sourceId)
+
+# Define colors for each station
+station_colors <- c(
+  "METSN52290:0" = "purple", 
+  "METSN46510:0" = "red",  
+  "METSN88000:0" = "cyan", 
+  "METSN97350:0" = "#9900cc" 
+)
+
+# Plot
+ggplot() +
+  geom_polygon(
+    data = bnd_nor_xy,
+    aes(X, Y, group = group),
+    fill = "lightgrey",
+    color = "black",
+    linewidth = 0.6
+  ) +
+  geom_point(data = stations_plot_data, 
+             aes(x = st_coordinates(stations_plot_data)[,1], 
+                 y = st_coordinates(stations_plot_data)[,2],
+                 color = sourceId),
+             size = 3) +
+  scale_color_manual(values = station_colors, name = "Station ID") +
+  coord_equal(
+    xlim = range(bnd_nor_xy$X, na.rm = TRUE),
+    ylim = range(bnd_nor_xy$Y, na.rm = TRUE),
+    expand = FALSE
+  ) +
+  scale_x_continuous(breaks = seq(-500, 1500, by = 200)) +
+  scale_y_continuous(breaks = seq(5000, 9000, by = 200)) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_line(color = "grey90"),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    
+    plot.title = element_text(size = 29),
+    axis.title = element_text(size = 19),
+    axis.text = element_text(size = 17),
+    legend.text = element_text(size = 17),
+    legend.title = element_text(size = 19)
+  ) +
+  ggtitle("Location of Chosen Weather Stations") +
+  labs(
+    x = "x (km)",
+    y = "y (km)"
+  ) 
+
+comparison_numerical_df_stations <- NULL
+# bind all numerical data at chosen stations
+comparison_numerical_df_stations <- rbind(
+  numerical_METSN97350,
+  numerical_METSN88000, 
+  numerical_METSN52290, 
+  numerical_METSN46510
+)
+
+# plot all station numerical vs stationd data comparison_numerical_df_all, but color the points by station ID from comparison_numerical_df
+ggplot(comparison_numerical_df_stations, aes(x = numerical_TG, y = station_TG, color = sourceId)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = rainbow(length(unique(comparison_numerical_df_stations$sourceId)))) +
+  geom_point(data = comparison_numerical_df, aes(x = numerical_TG, y = station_TG), color = "#d3d3d3", size = 3, alpha = 0.5) +
+  geom_point(data = comparison_numerical_df_stations, aes(x = numerical_TG, y = station_TG, color = sourceId), size = 3) +
+  theme_minimal() +
+  labs(
+    title = "Numerical Data at Station Loc. vs Station Data",
+    x = "Numerical Model Temperature (°C)",
+    y = "Station Temperature (°C)",
+    color = "Station ID"
+  ) +
+  theme(
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_line(color = "grey90"),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    
+    plot.title = element_text(size = 29),
+    axis.title = element_text(size = 29),
+    axis.text = element_text(size = 24),
+    legend.text = element_text(size = 24),
+    legend.title = element_text(size = 29)
+  ) +
+  # add line of best fit of comparison_numerical_df
+  geom_smooth(data = comparison_numerical_df, aes(x = numerical_TG, y = station_TG), 
+              method = "lm", color = "red", se = FALSE, size = 1)
+ggsave("AA/comparison_numerical_df_stations_plot.png", width = 12, height = 13)
+
+########################################################################
+# Plot the SPDE mesh
+########################################################################
+# need creat_mesh from models.Rmd to plot mesh
+create_mesh <- function() {
+  # construct a mesh covering Norway (simple border)
+  # Add a larger mesh around to avoid boudary issues (large variance at edges)
+  mesh <- inla.mesh.2d(boundary=bnd_nor,
+                       max.edge=c(25, 80), # inner, outer lengths in km
+                       min.angle=c(30, 25), # minimum angles in triangles, smaller angles = more triangles
+                       max.n=c(48000, 16000), # maximum number of triangles, inner, outer
+                       max.n.strict=c(128000, 128000), # strict maximum number of triangles, inner, outer
+                       cutoff = 10, # minimum allowed distance between points on the mesh
+                       offset=c(75, 250),# inner, outer extension (the boundary) in km.
+                       crs = crs_km) 
+  # count nodes inside Norway
+  mesh_nodes_sf <- st_as_sf(
+    data.frame(mesh$loc),
+    coords = c(1, 2),
+    crs = st_crs(bnd_nor)
+  )
+
+  bnd_nor_union <- st_union(bnd_nor)
+  inside <- st_within(mesh_nodes_sf, bnd_nor_union, sparse = FALSE)
+  sum(inside)
+
+  # count number of mesh nodes in total
+  n_nodes <- nrow(mesh$loc) 
+  n_nodes
+  # count number of triangles
+  n_triangles <- nrow(mesh$graph$tv)
+  return(mesh)
+}
+
+plot_mesh <- function(){
+  mesh <- create_mesh()
+  # transform mesh to data frame for plotting
+  tv <- mesh$graph$tv
+  loc <- mesh$loc
+
+  edges <- rbind(
+    tv[, c(1, 2)],
+    tv[, c(2, 3)],
+    tv[, c(3, 1)]
+    )
+
+  edges <- unique(t(apply(edges, 1, sort)))
+
+  mesh_df <- data.frame(
+    x    = loc[edges[, 1], 1],
+    y    = loc[edges[, 1], 2],
+    xend = loc[edges[, 2], 1],
+    yend = loc[edges[, 2], 2]
+    )
+
+  #plot mesh with boundary and station locations, want text size, axis and lables all the same as other plots
+  p <- ggplot() +
+    geom_segment(
+      data = mesh_df,
+      aes(x = x, y = y, xend = xend, yend = yend),
+      color = "lightgrey",
+      linewidth = 0.3
+    ) +
+    # plot bnd_nor_xy as a black line border
+    geom_polygon(
+      data = bnd_nor_xy,
+      aes(X, Y, group = group),
+      fill = NA,   # the fill color
+      color = "black",      # optional border
+      linewidth = 0.6
+    ) + 
+    coord_equal(
+      # xlim should be the limit of mesh_df, not bnd_nor
+      xlim = range(mesh_df$x, mesh_df$xend),
+      ylim = range(mesh_df$y, mesh_df$yend),
+      expand = FALSE
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid.major = element_line(color = "grey80"),
+      panel.grid.minor = element_line(color = "grey90"),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_blank(),
+      
+      plot.title = element_text(size = 29),
+      axis.title =element_blank(),
+      axis.text = element_blank(),
+      legend.text = element_text(size = 17),
+      legend.title = element_text(size = 19)
+    ) +
+    ggtitle("Mesh for over Norway") 
+  print(p)
+}
+plot_mesh()
+
+########################################################################
+# Multiplicative Bias Plot
+########################################################################
+res_df <- readRDS("AA/res_df_final_weighted.rds")
+# Plot the posterior weights for each value of b (multiplicative bias)
+plot(res_df$b, res_df$w, type = "b",
+     xlab = expression(b),
+     ylab = "Posterior weight")
+
+########################################################################
+# Predictions Plots
+########################################################################
+# plot mean prediction for chosen model and year
+plot_mean <- function(field, title, yy){
+  field_yy <- field %>% filter(year == yy)
+  # transform to data frame for ggplot
+  field_yy_df <- as.data.frame(field_yy, xy = TRUE)
+  # extrct x and y from geometry column
+  field_yy_df$x <- st_coordinates(field_yy)[,1]
+  field_yy_df$y <- st_coordinates(field_yy)[,2]
+
+  # plot mean field for chosen model with axises and size of text like other plots
+  ggplot() +
+    geom_raster(data = field_yy_df, aes(x = x, y = y, fill = mean)) +
+    colsc_TG_fill(field_yy_df$mean) +
+    geom_polygon(
+      data = bnd_nor_xy,
+      aes(x = X, y = Y, group = group),
+      # Only want border, not fill
+      fill = NA,   # the fill color
+      color = "black",      # optional border
+      linewidth = 0.6
+    ) + 
+    coord_equal(
+      xlim = range(bnd_nor_xy$X),
+      ylim = range(bnd_nor_xy$Y),
+      expand = FALSE
+    ) +
+    theme_minimal() + 
+    theme(
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_blank(),
+      axis.text = element_blank(),
+      axis.title = element_blank(), 
+
+      legend.text = element_text(size = 24),
+      legend.title = element_text(size = 29),
+      title = element_text(size = 29)
+    ) +
+    labs(
+      fill = paste0("Mean Temp. (°C)"),
+      x = "x (km)",
+      y = "y (km)",
+      title = paste0(title," (" , yy, ")")
+    )
+}
+# plot sd prediction for chosen model and year
+plot_sd <- function(field, title, yy){
+  field_yy <- field %>% filter(year == yy)
+  # transform to data frame for ggplot
+  field_yy_df <- as.data.frame(field_yy, xy = TRUE)
+  # extrct x and y from geometry column
+  field_yy_df$x <- st_coordinates(field_yy)[,1]
+  field_yy_df$y <- st_coordinates(field_yy)[,2]
+
+  # plot sd field for chosen model with axises and size of text like other plots
+  ggplot() +
+    geom_raster(data = field_yy_df, aes(x = x, y = y, fill = sd)) +
+    colsc(field_yy_df$sd) +
+    geom_polygon(
+      data = bnd_nor_xy,
+      aes(x = X, y = Y, group = group),
+      # Only want border, not fill
+      fill = NA,   # the fill color
+      color = "black",      # optional border
+      linewidth = 0.6
+    ) + 
+    coord_equal(
+      xlim = range(bnd_nor_xy$X),
+      ylim = range(bnd_nor_xy$Y),
+      expand = FALSE
+    ) +
+    theme_minimal() + 
+    theme(
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_blank(),
+      axis.text = element_blank(),
+      axis.title = element_blank(), 
+
+      legend.text = element_text(size = 24),
+      legend.title = element_text(size = 29),
+      title = element_text(size = 29)
+    ) +
+    labs(
+      fill = paste0("SD Temp. (°C)"),
+      title = paste0(title," (" , yy, ")")
+    )
+}
+
+yy <- 2008
+
+# reload predictions
+station_predict <- readRDS("AA/station_predict_final.rds")
+numerical_predict <- readRDS("AA/numerical_predict_final.rds")
+fusion_predict <- readRDS("AA/fusion_predict_final.rds")
+
+station_field <- readRDS("AA/station_field_final.rds")
+numerical_field <- readRDS("AA/numerical_field_final.rds")
+fusion_field <- readRDS("AA/fusion_field_final.rds")
+
+station_predict_training <- readRDS("AA/station_predict_training_final.rds")
+fusion_predict_training <- readRDS("AA/fusion_predict_training_final.rds")
+
+fusion_bias <- readRDS("AA/fusion_bias_final.rds")
+
+station_field_title <- "Stations-Only Model Field"
+numerical_field_title <- "Numerical-Data-Only Model Field"
+fusion_field_title <- "Data Fusion Model Field"
+
+station_title <- "Stations-Only Model"
+numerical_title <- "Numerical-Data-Only Model"
+fusion_title <- "Data Fusion Model"
+
+plot_mean(station_field, station_field_title, yy)
+ggsave("AA/station_field_2008.png", width = 10, height = 9)
+plot_sd(station_field, station_field_title, yy)
+ggsave("AA/station_field_sd_2008.png", width = 10, height = 9)
+plot_mean(station_predict, station_title, yy)
+ggsave("AA/station_predict_2008.png", width = 10, height = 9)
+plot_sd(station_predict, station_title, yy)
+ggsave("AA/station_predict_sd_2008.png", width = 10, height = 9)
+
+plot_mean(numerical_field, numerical_field_title, yy)
+ggsave("AA/numerical_field_2008.png", width = 10, height = 9)
+plot_sd(numerical_field, numerical_field_title, yy)
+ggsave("AA/numerical_field_sd_2008.png", width = 10, height = 9)
+plot_mean(numerical_predict, numerical_title, yy)
+ggsave("AA/numerical_predict_2008.png", width = 10, height = 9)
+plot_sd(numerical_predict, numerical_title, yy)
+ggsave("AA/numerical_predict_sd_2008.png", width = 10, height = 9)
+
+plot_mean(fusion_field, fusion_field_title, yy)
+ggsave("AA/fusion_field_2008.png", width = 10, height = 9)
+plot_sd(fusion_field, fusion_field_title, yy)
+ggsave("AA/fusion_field_sd_2008.png", width = 10, height = 9)
+plot_mean(fusion_predict, fusion_title, yy)
+ggsave("AA/fusion_predict_2008.png", width = 10, height = 9)
+plot_sd(fusion_predict, fusion_title, yy)
+ggsave("AA/fusion_predict_sd_2008.png", width = 10, height = 9)
+
+plot_mean(fusion_bias, "Fusion Model Bias", yy)
+ggsave("AA/fusion_bias_2008.png", width = 10, height = 9)
+plot_sd(fusion_bias, "Fusion Model Bias SD", yy)
+ggsave("AA/fusion_bias_sd_2008.png", width = 10, height = 9)
+
+# plot mean prediction for all methods beside each other with same color scale
+plot_all_mean <- function(station_field, numerical_field, fusion_field, station_method, numerical_method, fusion_method, yy){
+  # plot all field methods beside each other with same color scale
+  station_yy <- station_field %>% filter(year == yy)
+  numerical_yy <- numerical_field %>% filter(year == yy)
+  fusion_yy <- fusion_field %>% filter(year == yy)
+
+  station_yy$method <- station_method
+  numerical_yy$method <- numerical_method
+  fusion_yy$method <- fusion_method
+
+  all_predict_yy <- bind_rows(
+    station_yy,
+    numerical_yy,
+    fusion_yy
+  )
+
+  # transform to data frame for ggplot
+  all_predict_yy_df <- as.data.frame(all_predict_yy, xy = TRUE)
+  # extrct x and y from geometry column
+  all_predict_yy_df$x <- st_coordinates(all_predict_yy)[,1]
+  all_predict_yy_df$y <- st_coordinates(all_predict_yy)[,2]
+
+  # Set the factor levels to control facet order
+  all_predict_yy_df$method <- factor(all_predict_yy_df$method, 
+                                      levels = c(station_method, numerical_method, fusion_method))
+
+
+  # plot all methods beside each other with same color scale
+  p <- ggplot(all_predict_yy_df) +
+    geom_raster(data = all_predict_yy_df, aes(x = x, y = y, fill = mean)) +
+    colsc_TG_fill(all_predict_yy_df$mean) +
+    geom_polygon(
+      data = bnd_nor_xy,
+      aes(x = X, y = Y, group = group),
+      # Only want border, not fill
+      fill = NA,   # the fill color
+      color = "black",      # optional border
+      linewidth = 0.6
+    ) + 
+    coord_equal(
+      xlim = range(bnd_nor_xy$X),
+      ylim = range(bnd_nor_xy$Y),
+      expand = FALSE
+    ) +
+    facet_wrap(~ method, ncol = 3) +
+    theme_minimal() + 
+    theme(
+      strip.text = element_text(size = 29),
+
+      axis.line = element_line(color = "black"),
+      
+      axis.ticks = element_blank(),
+      axis.text = element_blank(),
+      axis.title = element_blank(),
+
+      legend.text = element_text(size = 24),
+      legend.title = element_text(size = 29)
+    ) +
+    labs(
+      fill = paste0("Mean Temp. (°C)")
+    )
+  print(p)
+}
+
+# plot sd prediction for all methods beside each other with same color scale
+plot_all_sd <- function(station, numerical, fusion, station_method, numerical_method, fusion_method, yy){
+
+  # plot all field methods beside each other with same color scale
+  station_yy <- station %>% filter(year == yy)
+  numerical_yy <- numerical %>% filter(year == yy)
+  fusion_yy <- fusion %>% filter(year == yy)
+
+  station_yy$method <- station_method
+  numerical_yy$method <- numerical_method
+  fusion_yy$method <- fusion_method
+
+  all_predict_yy <- bind_rows(
+    station_yy,
+    numerical_yy,
+    fusion_yy
+  )
+
+  # transform to data frame for ggplot
+  all_predict_yy_df <- as.data.frame(all_predict_yy, xy = TRUE)
+  # extrct x and y from geometry column
+  all_predict_yy_df$x <- st_coordinates(all_predict_yy)[,1]
+  all_predict_yy_df$y <- st_coordinates(all_predict_yy)[,2]
+
+  # Set the factor levels to control facet order
+  all_predict_yy_df$method <- factor(all_predict_yy_df$method, 
+                                      levels = c(station_method, numerical_method, fusion_method))
+
+
+  # plot all methods beside each other with same color scale
+  p <- ggplot(all_predict_yy_df) +
+    geom_raster(data = all_predict_yy_df, aes(x = x, y = y, fill = sd)) +
+    colsc(all_predict_yy_df$sd) +
+    geom_polygon(
+      data = bnd_nor_xy,
+      aes(x = X, y = Y, group = group),
+      # Only want border, not fill
+      fill = NA,   # the fill color
+      color = "black",      # optional border
+      linewidth = 0.6
+    ) + 
+    coord_equal(
+      xlim = range(bnd_nor_xy$X),
+      ylim = range(bnd_nor_xy$Y),
+      expand = FALSE
+    ) +
+    facet_wrap(~ method, ncol = 3) +
+    theme_minimal() + 
+    theme(
+      strip.text = element_text(size = 29),
+
+      axis.line = element_line(color = "black"),
+      
+      axis.ticks = element_blank(),
+      axis.text = element_blank(),
+      axis.title = element_blank(),
+
+      legend.text = element_text(size = 24),
+      legend.title = element_text(size = 29)
+    ) +
+    labs(
+      fill = paste0("SD. (°C)       ")
+    )
+
+  print(p)
+}
+
+station_field_method <- "Station Field"
+numerical_field_method <- "Numerical Field"
+fusion_field_method <- "Fusion Field"
+
+plot_all_mean(station_field, numerical_field, fusion_field, station_field_method , numerical_field_method, fusion_field_method, yy)
+ggsave("AA/field_only_comparison_2008.png", width = 16, height = 6)
+plot_all_sd(station_field, numerical_field, fusion_field, station_field_method , numerical_field_method, fusion_field_method, yy)
+ggsave("AA/field_only_SDcomparison_2008.png", width = 16, height = 6)
+
+station_method <- "Stations-Only Model"
+numerical_method <- "Numerical Model"
+fusion_method <- "Data Fusion Model"
+
+plot_all_mean(station_predict, numerical_predict, fusion_predict, station_method, numerical_method, fusion_method, yy)
+ggsave("AA/final_predict_comparison_2008.png", width = 16, height = 6)
+plot_all_sd(station_predict, numerical_predict, fusion_predict, station_method, numerical_method, fusion_method, yy)
+ggsave("AA/final_predict_SD_comparison_2008.png", width = 16, height = 6)
+
+# Plot mean predictions for all years (2001-2015) for a chosen model
+plot_all_years <- function(model, model_method){
+  # plot every year mean temperature from station_predict with grid like all other plots
+  # convert to data frame for ggplot
+  model_df <- as.data.frame(model, xy = TRUE)
+  # extrct x and y from geometry column
+  model_df$x <- st_coordinates(model)[,1]
+  model_df$y <- st_coordinates(model)[,2]
+
+  # plot all years beside each other with same color scale
+  p <- ggplot() +
+    geom_raster(data = model_df, aes(x = x, y = y, fill = mean)) +
+    colsc_TG_fill(model_df$mean) +
+    geom_polygon(
+      data = bnd_nor_xy,
+      aes(x = X, y = Y, group = group),
+      # Only want border, not fill
+      fill = NA,   # the fill color
+      color = "black",      # optional border
+      linewidth = 0.6
+    ) + 
+    coord_equal(
+      xlim = range(bnd_nor_xy$X),
+      ylim = range(bnd_nor_xy$Y),
+      expand = FALSE
+    ) +
+    facet_wrap(~ year, ncol = 3) + 
+    theme_minimal() + 
+    ggtitle(paste0(model_method, " Model Predictions (2001-2015)")) +
+    theme(
+      strip.text = element_text(face = "bold", size = 16),
+
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_blank(),
+      axis.text = element_blank(),
+      axis.title = element_blank(),
+
+      legend.text = element_text(size = 24),
+      legend.title = element_text(size = 29),
+      plot.title = element_text(hjust = 0.5, size = 29)
+    ) +
+    labs(
+      fill = paste0("Mean Temp. (°C)")
+    )
+    print(p)
+}
+plot_all_years(station_predict, "Stations-Only")
+ggsave("AA/station_predict_allyears_final.png", width = 12, height = 22)
+
+plot_all_years(numerical_predict, "Numerical")
+ggsave("AA/numerical_predict_allyears_final.png", width = 12, height = 22)
+
+plot_all_years(fusion_predict, "Data Fusion")
+ggsave("AA/fusion_predict_allyears_final.png", width = 12, height = 22)
+
+########################################################################
+# Comparison plots
+########################################################################
+
+# compare predicted temperature to observed temperature at station locations for yy
+#year of intrest
+yy <- 2008
+stations_predict_sf <- station_predict %>% filter(year == yy)
+stations_data_sf <- station_weatherdata %>% filter(year == yy)
+
+# Convert to sf objects
+stations_data_sf <- st_as_sf(stations_data_sf, coords = c("x", "y"), crs = crs_km)
+# Extract predicted data values at the station points
+stations_predicted <- stations_data_sf %>% 
+  st_join(stations_predict_sf, join = st_nearest_feature)
+stations_data_sf$TG_predicted <- stations_predicted$mean
+# Scatterplot comparison
+ggplot(stations_data_sf, aes(x = TG, y = TG_predicted)) +
+  geom_point(color = "red", size = 2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(
+    x = "Observed temperature (°C)",
+    y = "Predicted temperature (°C)",
+    title = paste0("Stations-Only Predictions at Station Location (", yy, ")")
+  ) +
+  theme_minimal() +
+  # change axis text size
+  theme(
+    axis.title = element_text(size = 29),
+    axis.text = element_text(size = 24),
+    plot.title = element_text(hjust = 0.5, size = 29)
+  )
+filename_yy <- paste0("AA/stationonly_obs_vs_pred_", yy, ".png")
+ggsave(filename_yy, width = 14, height = 14)
+
+# Compare predicted temp with numerical temp and station temp
+# Convert to sf objects
+numerical_sf <- st_as_sf(rast_testday_numerical,
+                         coords = c("x", "y"), crs = crs_km)
+
+# extract only yy data from rast_testday_numerical
+numerical_sf <- numerical_sf %>% filter(year == yy)
+
+# Extract numerical data values at the station/prediction points
+num_station_data <- stations_data_sf %>% 
+  st_join(numerical_sf, join = st_nearest_feature)
+
+num_station_prediction <- stations_predict_sf %>% 
+  st_join(numerical_sf, join = st_nearest_feature)
+
+stations_data_sf$TG_num <- num_station_data$TG_num
+stations_predict_sf$TG_num <- num_station_prediction$TG_num
+
+# Scatterplot comparison
+ggplot() +
+  geom_point(
+    data = stations_predict_sf,
+    aes(x = TG_num, y = mean, color = "Predicted Temp."),
+    size = 1
+  ) +
+  geom_point(
+    data = stations_data_sf,
+    aes(x = TG_num, y = TG, color = "Observed Temp."),
+    size = 2
+  ) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  scale_color_manual(
+    name = "Data source",
+    values = c(
+      "Observed Temp." = "red",
+      "Predicted Temp." = "lightblue"
+    )
+  ) +
+  labs(
+    x = "NORA3 Model Data (°C)",
+    y = "Observed / Predicted Station Temperature (°C)",
+    title = paste0("Stations-only Prediction and Observations vs NORA3 Data (", yy, ")")
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 29),
+    axis.text = element_text(size = 24),
+    plot.title = element_text(hjust = 0.5, size = 29),
+    legend.title = element_text(size = 29),
+    legend.text = element_text(size = 24)
+  )
+filename_yy <- paste0("AA/stationonly_obsandpred_vs_NORA3", yy, ".png")
+ggsave(filename_yy, width = 16, height = 14)
+
+# prepare data for comparison of all three (station predictions, numerical predictions and observations) at station locations for yy
+
+# Extract values at station locations from predicted station model
+stations_pred <- station_predict %>% filter(year == yy)
+
+stations_pred_stationloc <- stations_data_sf %>% 
+  st_join(stations_pred, join = st_nearest_feature)
+
+stations_data_sf$TG_stations_predicted <- stations_pred_stationloc$mean
+
+# Extract values at station locations from predicted nuemrical model
+numerical_pred <- numerical_predict %>% filter(year == yy)
+
+numerical_pred_stationloc <- stations_data_sf %>% 
+  st_join(numerical_pred, join = st_nearest_feature)
+
+stations_data_sf$TG_num_predicted <- numerical_pred_stationloc$mean
+
+# Extract values at station locations from predicted fusion model
+full_pred <- fusion_predict %>% filter(year == yy)
+
+full_pred_stationloc <- stations_data_sf %>% 
+  st_join(full_pred, join = st_nearest_feature)
+
+stations_data_sf$TG_full_predicted <- full_pred_stationloc$mean
+
+# Numerical model predictions at station locations compared to observed station temperatures
+ggplot() +
+  geom_point(
+    data = stations_data_sf,
+    aes(x = TG_num_predicted, y = TG),
+    color = "purple",
+    size = 2
+  ) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(
+    x = "Predicted Temperature at Station Locations (°C)",
+    y = "Observed Temperature at Stations Locations (°C)",
+    title = paste("Numerical Model Predictions at Station Locations vs Observations", yy)
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 29),
+    axis.text = element_text(size = 24),
+    plot.title = element_text(hjust = 0.5, size = 29)
+  )
+ggsave(paste0("AA/numerical_vs_obs_stationloc_", yy, ".png"), width = 14, height = 14)
+
+
+# Plot station measurments against the predicted numerical model at the station locations. 
+ggplot() +
+  # new plot with three colors for three models so they are in values for legend
+  geom_point(
+    data = stations_data_sf,
+    aes(x = TG_stations_predicted, y = TG, color = "Stations-only"),
+    size = 2
+  ) +
+  geom_point(
+    data = stations_data_sf,
+    aes(x = TG_num_predicted, y = TG, color = "Numerical"),
+    size = 2
+  ) +
+  geom_point(
+    data = stations_data_sf,
+    aes(x = TG_full_predicted, y = TG, color = "Fusion Model"),
+    size = 2
+  ) +
+  # add legend
+  scale_color_manual(
+    name = "Model",
+    values = c(
+      "Stations-only" = "red",
+      "Numerical" = "purple",
+      "Fusion Model" = "green"
+    )
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 29),
+    axis.text = element_text(size = 24),
+    plot.title = element_text(hjust = 0.5, size = 29),
+    legend.title = element_text(size = 29),
+    legend.text = element_text(size = 24)
+  ) + 
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(
+    x = "Predicted Temperature at Station Locations (°C)",
+    y = "Observed Temperature at Stations Locations (°C)",
+    title = paste0("Observed vs Predicted Temperatures at Station Locations (", yy, ")")
+    #title = "Stations-only & Numerical Model Predictions vs Observations"
+  )
+
+ggsave(paste0("AA/compare_station_numerical_fusion_obs_", yy, ".png"), width = 17, height = 12)
+
+# same again but use station and fusion training models and numerical normal model
+# Extract values at station locations from predicted station model
+stations_pred_training <- station_predict_training %>% filter(year == yy)
+
+stations_pred_stationloc_training <- stations_data_sf %>% 
+  st_join(stations_pred_training, join = st_nearest_feature)
+
+stations_data_sf$TG_stations_predicted_training <- stations_pred_stationloc_training$mean
+
+# Extract values at station locations from predicted fusion model
+full_pred_training <- fusion_predict_training %>% filter(year == yy)
+
+full_pred_stationloc <- stations_data_sf %>% 
+  st_join(full_pred_training, join = st_nearest_feature)
+
+stations_data_sf$TG_full_predicted_training <- full_pred_stationloc$mean
+
+# Plot station measurments against the predicted numerical model at the station locations. 
+ggplot() +
+  # new plot with three colors for three models so they are in values for legend
+  geom_point(
+    data = stations_data_sf,
+    aes(x = TG_stations_predicted_training, y = TG, color = "Stations-only Training Model"),
+    size = 2
+  ) +
+  geom_point(
+    data = stations_data_sf,
+    aes(x = TG_num_predicted, y = TG, color = "Numerical Model"),
+    size = 2
+  ) +
+  geom_point(
+    data = stations_data_sf,
+    aes(x = TG_full_predicted_training, y = TG, color = "Fusion Training Model"),
+    size = 2
+  ) +
+  # add legend
+  scale_color_manual(
+    name = "Model",
+    values = c(
+      "Stations-only Training Model" = "red",
+      "Numerical Model" = "purple",
+      "Fusion Training Model" = "green"
+    )
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 14),
+    plot.title = element_text(hjust = 0.5, size = 24),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 16)
+  ) + 
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(
+    x = "Predicted Temperature at Station Locations (°C)",
+    y = "Observed Temperature at Stations Locations (°C)",
+    title = paste0("Observed vs Predicted Temperatures at Station Locations (", yy, ")")
+  )
+
+ggsave(paste0("AA/training_compare_station_numerical_fusion_obs_", yy, ".png"), width = 17, height = 12)
+
+########################################################################
+# Cross validation study
+########################################################################
+results <- readRDS("results_CV_ALL.rds")
+
+# Filter to only Stations and Fusion models
+results_filtered <- results %>% 
+  filter(Model %in% c("Stations", "Fusion"))
+
+# Set proper order for Fold
+results_filtered$Fold <- factor(results_filtered$Fold, 
+                                levels = c("loocv", "lgocv.m3", "lgocv.m5", "lgocv.m10"))
+
+# RMSPE plot
+p1_full <- ggplot(results_filtered, aes(x = Fold, y = RMSPE, color = Model, group = Model)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 4) +
+  scale_color_manual(
+    name = "Model",
+    values = c(
+      "Stations" = "red",
+      "Fusion" = "darkgreen"
+    )
+  ) +
+  labs(
+    x = "Cross-validation Fold",
+    y = "RMSPE",
+    title = "Model Performance Comparison: RMSPE"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 33),
+    axis.text = element_text(size = 30),
+    plot.title = element_text(hjust = 0.5, size = 35),
+    legend.title = element_text(size = 35),
+    legend.text = element_text(size = 33)
+  )
+
+# Log Score plot
+p2_full <- ggplot(results_filtered, aes(x = Fold, y = LS_mean, color = Model, group = Model)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 4) +
+  scale_color_manual(
+    name = "Model",
+    values = c(
+      "Stations" = "red",
+      "Fusion" = "darkgreen"
+    )
+  ) +
+  labs(
+    x = "Cross-validation Fold",
+    y = "Mean Log Score",
+    title = "Model Performance Comparison: Mean Log Score"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 33),
+    axis.text = element_text(size = 30),
+    plot.title = element_text(hjust = 0.5, size = 35),
+    legend.title = element_text(size = 35),
+    legend.text = element_text(size = 33)
+  )
+
+# Log Score plot
+p3_full <- ggplot(results_filtered, aes(x = Fold, y = CRPS, color = Model, group = Model)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 4) +
+  scale_color_manual(
+    name = "Model",
+    values = c(
+      "Stations" = "red",
+      "Fusion" = "darkgreen"
+    )
+  ) +
+  labs(
+    x = "Cross-validation Fold",
+    y = "CRPS",
+    title = "Model Performance Comparison: CRPS"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 33),
+    axis.text = element_text(size = 30),
+    plot.title = element_text(hjust = 0.5, size = 35),
+    legend.title = element_text(size = 35),
+    legend.text = element_text(size = 33)
+  )
+
+# Display plots
+print(p1_full)
+print(p2_full)
+print(p3_full)
+
+p1_full <- p1_full + theme(legend.position = "none")
+p3_full <- p3_full + theme(legend.position = "none")
+
+# Save plots
+ggsave("AA/CV_RMSPE_comparison.png", p1_full, width = 10, height = 12)
+ggsave("AA/CV_LSmean_comparison.png", p2_full, width = 12, height = 12)
+ggsave("AA/CV_CRPS_comparison.png", p3_full, width = 10, height = 12)
+
+########################################################################
+# Manual Spatial Hold-Out Scheme 
+########################################################################
+results_training <- readRDS("AA/results_training.rds")
+
+results_training_clean <- results_training %>% filter(!model == "NORA3 Output Model") 
+results_training_clean <- results_training_clean %>% filter(!model == "Numerical Model") 
+
+# Clean up the model names for better display
+results_training_clean <- results_training_clean %>%
+  mutate(
+    model_short = case_when(
+      grepl("Stations-only", model) ~ "Stations-only Training Model",
+      grepl("Fusion", model) ~ "Fusion Training Model"
+    ),
+    model_short = factor(model_short, levels = c("Stations-only Training Model", "Fusion Training Model"))
+  )
+
+# RMSPE plot (lower is better)
+p1_training <- ggplot(results_training_clean, aes(x = year, y = RMSPE, color = model_short)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 4) +
+  scale_color_manual(
+    name = "Model",
+    values = c(
+      "Stations-only Training Model" = "red",
+      "Fusion Training Model" = "darkgreen"
+    )
+  ) +
+  labs(
+    x = "Year",
+    y = "RMSPE",
+    title = "Model Performance Comparison: RMSPE"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 33),
+    axis.text = element_text(size = 30),
+    plot.title = element_text(hjust = 0.5, size = 35),
+    legend.title = element_text(size = 33),
+    legend.text = element_text(size = 30)
+  ) +
+  scale_x_continuous(breaks = seq(2001, 2015, 2))
+
+# Log Score plot (higher/closer to 0 is better)
+p2_training <- ggplot(results_training_clean, aes(x = year, y = LS_mean, color = model_short)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 4) +
+  scale_color_manual(
+    name = "Model",
+    values = c(
+      "Stations-only Training Model" = "red",
+      "Fusion Training Model" = "darkgreen"
+    )
+  ) +
+  labs(
+    x = "Year",
+    y = "Mean Log Score",
+    title = "Model Performance Comparison: Mean Log Score"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 33),
+    axis.text = element_text(size = 30),
+    plot.title = element_text(hjust = 0.5, size = 35),
+    legend.title = element_text(size = 33),
+    legend.text = element_text(size = 30)
+  ) +
+  scale_x_continuous(breaks = seq(2001, 2015, 2))
+
+# Log Score plot (higher/closer to 0 is better)
+p3_training <- ggplot(results_training_clean, aes(x = year, y = CRPS, color = model_short)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 4) +
+  scale_color_manual(
+    name = "Model",
+    values = c(
+      "Stations-only Training Model" = "red",
+      "Fusion Training Model" = "darkgreen"
+    )
+  ) +
+  labs(
+    x = "Year",
+    y = "CRPS",
+    title = "Model Performance Comparison: CRPS"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 33),
+    axis.text = element_text(size = 30),
+    plot.title = element_text(hjust = 0.5, size = 35),
+    legend.title = element_text(size = 33),
+    legend.text = element_text(size = 30)
+  ) +
+  scale_x_continuous(breaks = seq(2001, 2015, 2))
+
+
+# Display plots
+print(p1_training)
+print(p2_training)
+print(p3_training)
+
+p1_training <- p1_training + theme(legend.position = "none")
+p3_training <- p3_training + theme(legend.position = "none")
+
+# Save plots with your standard dimensions
+ggsave("AA/training_RMSPE_comparison.png", p1_training, width = 17, height = 13)
+ggsave("AA/training_LSmean_comparison.png", p2_training, width = 22, height = 13)
+ggsave("AA/training_CRPS_comparison.png", p3_training, width = 17, height = 13)
+
+# Compare fusion model to NORA3 output model in training results
+
+# Clean up the model names for better display
+results_training_NORA3comp <- results_training %>%
+  mutate(
+    model_short = case_when(
+      grepl("Stations-only", model) ~ "Stations-only Training Model",
+      grepl("Fusion", model) ~ "Fusion Training Model",
+      grepl("Numerical", model) ~ "Numerical Model",
+      grepl("NORA3 Output", model) ~ "NORA3 Output Model"
+    ),
+    model_short = factor(model_short, levels = c("Stations-only Training Model", "Fusion Training Model", "Numerical Model", "NORA3 Output Model"))
+  )
+
+results_num_output_comparison <- results_training_NORA3comp  %>% filter(model == "NORA3 Output Model" |  model == "Fusion Training Model") 
+
+# RMSPE plot (lower is better)
+p1_NORA3comp <- ggplot(results_num_output_comparison, aes(x = year, y = RMSPE, color = model_short)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 4) +
+  scale_color_manual(
+    name = "Model",
+    values = c(
+      #"Stations-only Training Model" = "red",
+      "Fusion Training Model" = "darkgreen",
+      "NORA3 Output Model" = "blue"
+    )
+  ) +
+  labs(
+    x = "Year",
+    y = "RMSE",
+    title = "Model Performance Comparison: RMSE"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 29),
+    axis.text = element_text(size = 24),
+    plot.title = element_text(hjust = 0.5, size = 29),
+    legend.title = element_text(size = 29),
+    legend.text = element_text(size = 24)
+  ) +
+  scale_x_continuous(breaks = seq(2001, 2015, 2))
+  
+print(p1_NORA3comp)
+ggsave("AA/NORA3_RMSE_comparison.png", p1_NORA3comp, width = 17, height = 12)
+```
