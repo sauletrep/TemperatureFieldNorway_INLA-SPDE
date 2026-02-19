@@ -1,0 +1,946 @@
+```{r data_preparation}
+
+########################################################################
+# Load all necessary libraries
+########################################################################
+
+library(terra) # for raster data handling
+library(raster) # for raster data handling (some functions not in terra)
+library(rvest) # for web scraping
+library(dplyr) # for data manipulation
+library(tidyverse) # for data manipulation and plotting
+library(ggplot2) # for plotting
+library(sf) # for spatial data handling
+library(rnaturalearthdata) # for natural earth data
+library(rnaturalearth) # for country boundaries
+library(geodata) # for elevation data
+library(spatialEco) # for distance to coast function
+
+########################################################################
+# Color scale functions for plotting
+########################################################################
+
+colsc <- function(...) {
+  scale_fill_gradientn(
+    colours = rev(RColorBrewer::brewer.pal(11, "RdYlBu")),
+    limits = range(..., na.rm = TRUE)
+  )
+}
+
+# color scale function, with terra colors
+colsc_TG_fill <- function(...) {
+  scale_fill_gradientn(
+    colours = rev(hcl.colors(100, "viridis")),
+    limits = range(..., na.rm = TRUE)
+  )
+}
+
+colsc_TG <- function(...) {
+  scale_color_gradientn(
+    colours = rev(hcl.colors(100, "viridis")),
+    limits = range(..., na.rm = TRUE)
+  )
+}
+
+########################################################################
+# Norwegian boundary polygon preparation
+########################################################################
+
+# Define km-CRS
+crs_km <- "+proj=utm +zone=33 +datum=WGS84 +units=km +no_defs"
+
+# Download Norway boundary as an sf polygon
+norway_medium <- ne_countries(country = "Norway", scale = "medium", returnclass = "sf")
+
+norway_area <- function(norway_size){
+  # Convert to UTM (km) for easier distance calculations and filtering
+  norway_utm <- st_transform(norway_size, crs_km) # UTM zone 33N
+
+  # Split multipolygon into individual polygons
+  norway_parts <- norway_utm %>% st_cast("POLYGON")
+
+  # Get the minimum y (northing) for each polygon
+  min_y <- sapply(
+    st_geometry(norway_parts),
+    function(poly) min(st_coordinates(poly)[,2])
+  )
+
+  # Get the maximum y (northing) for each polygon
+  max_y <- sapply(
+    st_geometry(norway_parts),
+    function(poly) max(st_coordinates(poly)[,2])
+  )
+
+  # Find which polygons have min y < -6000
+  poly_min_y <- which(min_y < -6000)
+  # Find which polygons have min y > 8000
+  poly_max_y <- which(max_y > 8000)
+
+  # Combine the indices for polygons to exclude
+  exclude_polys <- c(poly_min_y, poly_max_y)
+
+  # Remove the unwanted polygons from norway_parts
+  norway_utm <- norway_parts %>%
+    mutate(area = st_area(geometry)) %>%
+    slice(-exclude_polys)
+
+  return(norway_utm)
+}
+
+# Norwegian boundary polygon
+bnd_nor <- norway_area(norway_medium)
+saveRDS(bnd_nor, file = "AA/bnd_nor.rds")
+bnd_nor <- readRDS("AA/bnd_nor.rds")
+
+# Convert to data frame with group
+bnd_nor_tr <- st_transform(bnd_nor, crs_km)
+coords <- st_coordinates(bnd_nor_tr)
+bnd_nor_xy <- data.frame(
+  X = coords[, "X"],
+  Y = coords[, "Y"],
+  group = interaction(coords[, "L1"], coords[, "L2"])
+)
+saveRDS(bnd_nor_xy, file = "AA/bnd_nor_xy.rds")
+bnd_nor_xy <- readRDS("AA/bnd_nor_xy.rds")
+########################################################################
+# Functions for reading, downloading, and preparing numerical and station data
+########################################################################
+
+all_rasters <- NULL  # will hold all daily layers of numerical data
+
+read_download_num_data <- function(start_year, end_year, start_month, end_month, start_day, end_day) {
+  # Mother function
+
+  # First check if data is already in all_rasters, don't need to do anything more if it is
+  if (!is.null(all_rasters)) {
+    test_name <- paste0("met_", start_year, start_month, start_day)
+    if (test_name %in% names(all_rasters)) {
+      return(NULL) # data already loaded
+    }
+  }
+  # use the read_html() from the rvest package to read the HTML content of the website
+  url_years <- "https://thredds.met.no/thredds/catalog/metppltcarchivev1/derived_products/daily_products/catalog.html"
+  
+  # read the html content
+  webpage_years <- read_html(url_years) # converts URL to a readable format in HTML
+  
+  # extract all years with data on the webpage
+  num_years <- html_nodes(webpage_years, "tr~ tr+ tr a tt") %>% html_text() %>% str_replace_all("/", "")
+  
+  #num_years <- read_num_years()
+  num_years <- num_years[num_years >= start_year & num_years <= end_year] # "2024", "2023", ...
+  
+  for (i in num_years) {
+    url_months <- paste0("https://thredds.met.no/thredds/catalog/metppltcarchivev1/derived_products/daily_products/", i, "/catalog.html")
+  
+    webpage_moths <- read_html(url_months)
+  
+    num_months <- html_nodes(webpage_moths, "tr~ tr+ tr a tt") %>% html_text() %>% str_replace_all("/", "")
+    #num_months <- read_num_months(i) # "12", "11", .. "01".
+    num_months <- num_months[num_months >= start_month & num_months <= end_month]
+    
+    for (j in num_months)  {
+      url_days <- paste0("https://thredds.met.no/thredds/catalog/metppltcarchivev1/derived_products/daily_products/", i, "/", j, "/catalog.html")
+  
+      webpage_days <- read_html(url_days)
+  
+      num_days <- html_nodes(webpage_days, "tr~ tr+ tr a tt") %>% html_text() %>% str_replace_all("/", "")
+
+      num_days <- rev(num_days)
+      #num_days <- rev(read_num_days(i, j)) # "01", "02", ..., "28" etc.
+      
+      days_numeric <- as.integer(num_days)
+      start_day_numeric <- as.integer(start_day)
+      end_day_numeric <- as.integer(end_day)
+      
+      num_days <- num_days[days_numeric >= start_day_numeric & days_numeric <= min(end_day_numeric, max(days_numeric))]
+      
+      for (k in num_days) {
+        # Build destination file name
+        destfile <- paste0("met_daily_datafiles/met_daily_", i, j, k,".nc")
+        
+        # Avoid downloading the same file multiple times 
+        if (!file.exists(destfile)) {
+          url_code <- paste0("https://thredds.met.no/thredds/catalog/metppltcarchivev1/derived_products/daily_products/", i, "/", j, "/", k, "/catalog.html")
+            
+          webpage_code <- read_html(url_code)
+          
+          yyyymmddcode <- html_nodes(webpage_code, "tr:nth-child(3) a tt") %>% html_text() # %>% str_replace_all("/", "")
+          
+          url_num_data <- paste0("https://thredds.met.no/thredds/fileServer/metppltcarchivev1/derived_products/daily_products/", i, "/", j, "/", k, "/", yyyymmddcode)
+          
+          # download to working directory
+          destfile <- paste0("met_daily_datafiles/met_daily_", i, j, k,".nc")
+          download.file(url_num_data, destfile = destfile, mode = "wb")
+        
+          # open with terra
+          SR_ijk <- rast(destfile) # SpatRaster format
+        
+          # Convert to km with correct crs
+          SR_ijk <- project(SR_ijk, crs_km)
+        
+          #SR_ijk <- download_num_data(i, j, k)
+        
+        } else {
+          SR_ijk <- rast(destfile)
+        }
+        
+        # handle fill values and outliers for old files
+        temp <- values(SR_ijk)
+        fill <- NA
+        if ("_FillValue" %in% names(attributes(SR_ijk[[1]]))) {
+          fill <- attr(SR_ijk[[1]], "_FillValue")
+          temp[temp == fill] <- NA
+        }
+        
+        temp[temp >= 100] <- NA # remove outliers 
+        values(SR_ijk) <- temp
+        
+        # Give each layer a meaningful name
+        names(SR_ijk) <- paste0("met_",i, j, k)
+
+        # Project on correct CRS and convert to km
+        if (crs(SR_ijk) != crs_km) {
+          SR_ijk <- project(SR_ijk, crs_km)
+        }
+
+        # add this day's raster as a new layer
+        if (is.null(all_rasters)) {
+          all_rasters <<- SR_ijk # using <<-updates global variable
+        } else {
+          all_rasters <<- c(all_rasters, SR_ijk)
+        }
+      }
+    }
+  }
+  return(SR_ijk)
+}
+
+numerical_data <- function(i, j, k){
+  test_name <- paste0("met_", i, j, k)
+
+  # Only download if the layer is NOT already in all_rasters
+  if (is.null(all_rasters) || !(test_name %in% names(all_rasters))) {
+    read_download_num_data(i, i, j, j, k, k)
+  }
+
+  chosen_testday <- all_rasters[[test_name]]
+
+  # convert raster to km properly (scale coordinates by 1000) incase it has not been already
+  chosen_testday_km <- terra::project(chosen_testday, crs_km)
+  
+  # crop first to reduce memory
+  chosen_testday_km <- terra::crop(chosen_testday_km, bnd_nor)
+  # mask to remove everything outside Norway
+  chosen_testday_km <- terra::mask(chosen_testday_km, bnd_nor)
+
+  chosen_testday_df <- as.data.frame(chosen_testday_km, xy = TRUE, na.rm = TRUE)
+
+  # Give the temperature column a fixed name
+  names(chosen_testday_df)[names(chosen_testday_df) == test_name] <- "temperature"
+
+  # Build title
+  ggtitle_chosen_day <- paste0("Numerical model temperature on ", k,".",j,".",i)
+
+  # Plot
+  p <- ggplot(chosen_testday_df) +
+    geom_raster(aes(x = x, y = y, fill = temperature)) +
+    colsc_TG_fill(chosen_testday_df$temperature) +
+    geom_path(
+      data = bnd_nor_xy,
+      aes(X, Y, group = group),
+      color = "grey",
+      linewidth = 0.6
+    ) +
+    coord_equal(
+      xlim = range(bnd_nor_xy$X),
+      ylim = range(bnd_nor_xy$Y),
+      expand = FALSE
+    ) +
+    theme_minimal() +
+    theme(
+        panel.grid.major = element_line(color = "grey80"),
+        panel.grid.minor = element_line(color = "grey90"),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        
+        plot.title = element_text(size = 29),
+        legend.text = element_text(size = 24),
+        legend.title = element_text(size = 29)
+    ) +
+    ggtitle(ggtitle_chosen_day) +
+    labs(
+      fill = "TG (°C)",
+      x = "x (km)",
+      y = "y (km)"
+    )
+  print(p)
+  
+  names(chosen_testday_km) <- "TG_num"
+  return(chosen_testday_km)
+}
+
+station_data <- function(i, j, k){
+  # First extract data in a dataframe for a given date
+  file_path <- paste0("weatherstationdata/unpacked/case_20250215/ngcd_v2503/", i, "/", j, "/", k, "/ngcd_case_TG_", i, j, k, ".txt") 
+  df <- read.table(file_path, header = TRUE, sep = "", stringsAsFactors = FALSE)
+
+  # correct the collums
+  df <- do.call(rbind, strsplit(as.character(df[[1]]), ";"))
+  df <- as.data.frame(df, stringsAsFactors = FALSE)
+  # the correct column names are: sourceId, lat, lon, elev, value, prid, dqc
+  correct_colnames <- colnames(df) 
+  # slit the correct column names by .
+  strsplit(correct_colnames, "\\.") # split by "."
+  # now replave V1, V2, etc with the correct column names and insert in df
+  df <- setNames(df, c("sourceId", "lat", "lon", "elev", "TG", "prid", "dqc"))
+
+  # convert the columns to the correct data types. 
+  df$lat <- as.numeric(df$lat)
+  df$lon <- as.numeric(df$lon)
+  df$elev <- as.numeric(df$elev)
+  df$TG <- as.numeric(df$TG) # temperature in celsius
+  df$prid <- as.integer(df$prid)
+  df$dqc <- as.integer(df$dqc)
+
+  # Now i want to see the TG observations at weather station locations
+  df_weatherdata <- df
+
+  # Convert the data frame to an sf object
+  sf_weatherdata <- sf::st_as_sf(df_weatherdata, coords = c("lon", "lat"), crs = 4326)
+
+  # the location is in degrees long/lat, need to convert to km and correct UTM
+  sf_weatherdata <- st_transform(sf_weatherdata, crs_km) 
+  weatherdata <- sf_weatherdata
+  # only keep the stations inside Norway
+  weatherdata <- sf_weatherdata[bnd_nor, ]
+
+  # rename elevation column to elev_km and scale to km
+  weatherdata <- weatherdata %>%
+    rename(elev_km = elev) %>%
+    mutate(elev_km = elev_km / 1000)
+  
+  # Extract coordinates
+  weatherdata_xy <- data.frame(
+    st_coordinates(weatherdata),
+    TG = weatherdata$TG
+  )
+
+  # Plot
+  p <- ggplot(weatherdata_xy) +
+      geom_polygon(
+        data = bnd_nor_xy,
+        aes(X, Y, group = group),
+        fill = "lightgrey",   # the fill color
+        color = "black",      # optional border
+        linewidth = 0.6
+      ) + 
+      geom_point(
+        aes(x = X, y = Y, color = TG),
+        size = 2
+      ) +
+      colsc_TG(weatherdata_xy$TG) +
+    coord_equal(
+      xlim = range(bnd_nor_xy$X),
+      ylim = range(bnd_nor_xy$Y),
+      expand = FALSE
+    ) +
+      theme_minimal() +
+      theme(
+        panel.grid.major = element_line(color = "grey80"),
+        panel.grid.minor = element_line(color = "grey90"),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        
+        plot.title = element_text(size = 29),
+        legend.text = element_text(size = 24),
+        legend.title = element_text(size = 29)
+      ) +
+      ggtitle(paste0("Observed values at weather stations on ", k,".", j,".", i)) +
+      labs(
+        color = "TG (°C)"
+      )
+  print(p)
+  return(weatherdata)
+}
+
+numerical_data(i = "2001", j = "01", k = "01") # test the function for one day
+station_data(i = "2001", j = "01", k = "01") # test the function for one day
+
+########################################################################
+# Collect station and numerical data for 1 January 2001 - 2015 (and 1 July 2001 - 2015)
+########################################################################
+
+weatherdata_years <- function(month, day){
+  c <- 0
+  
+  for (yr in years){
+    c <- c + 1
+    mm <- sprintf("%02d", month)
+    dd <- sprintf("%02d", day)
+    yyyy <- as.character(yr)
+    
+    # Load station data
+    station_data_yyyy <- station_data(yyyy, mm, dd)
+    
+    # Set time counter
+    station_data_yyyy$year <- yr
+    station_data_yyyy$time <- c
+    station_data_yyyy$month <- month
+    
+    if (is.null(station_all)) {
+      station_all <<- station_data_yyyy
+    } else {
+      station_all <<- rbind(station_all, station_data_yyyy)
+    }
+    
+    # Load numerical data
+    numerical_data_yyyy <- numerical_data(yyyy, mm, dd)
+    
+    # aggregate while still a raster
+    numerical_data_yyyy <- terra::aggregate(numerical_data_yyyy, fact = 10, fun = mean)
+  
+    numerical_data_df <- as.data.frame(numerical_data_yyyy, xy = TRUE)
+    numerical_data_df$year <- yr
+    numerical_data_df$time <- c
+    numerical_data_df$month <- month
+    
+    # append rows
+    if (is.null(numerical_all)) {
+      numerical_all <<- numerical_data_df
+    } else {
+      numerical_all <<- rbind(numerical_all, numerical_data_df)
+      }
+    }
+}
+
+# Can choose any year range, month and day, but for our project we focus on 1 January and 1 July data from 2001 to 2015
+year_start <- 2001
+year_stop <- 2015
+years <- year_start:year_stop
+
+station_all <- NULL
+numerical_all <- NULL
+weatherdata_years(1, 1) 
+saveRDS(station_all, file = "AA/station_all_01.01.rds")
+saveRDS(numerical_all, file = "AA/numerical_all_01.01.rds")
+
+station_all <- NULL
+numerical_all <- NULL
+weatherdata_years(7, 1)
+saveRDS(station_all, file = "AA/station_all_01.07.rds")
+saveRDS(numerical_all, file = "AA/numerical_all_01.07.rds")
+
+# Re-load data
+station_weatherdata_01.01 <- readRDS("AA/station_all_01.01.rds")
+rast_testday_numerical_01.01 <- readRDS("AA/numerical_all_01.01.rds")
+station_weatherdata_01.07 <- readRDS("AA/station_all_01.07.rds")
+rast_testday_numerical_01.07 <- readRDS("AA/numerical_all_01.07.rds")
+
+# For our project we focus on the 1st of January data
+station_weatherata <- NULL
+rast_testday_numerical <- NULL
+station_weatherdata <- station_weatherdata_01.01
+rast_testday_numerical <- rast_testday_numerical_01.01
+numerical_model_data <- st_as_sf(rast_testday_numerical, coords = c("x", "y"), crs = crs_km)
+
+# Center time values
+mean_time <- mean(station_weatherdata$time)
+station_weatherdata$time <- station_weatherdata$time - mean_time
+rast_testday_numerical$time <- rast_testday_numerical$time - mean_time
+time_vals <- (1:length(years)) - mean_time   # centered time values used in model
+
+saveRDS(years, file = "AA/years.rds")
+saveRDS(mean_time, file = "AA/mean_time.rds")
+saveRDS(time_vals, file = "AA/time_vals.rds")
+saveRDS(station_weatherdata, file = "AA/station_weatherdata_centered.rds")
+saveRDS(rast_testday_numerical, file = "AA/rast_testday_numerical_centered.rds")
+
+########################################################################
+# Collect training station data for 1 January 2001 - 2015
+########################################################################
+
+station_METSN97350 <- station_weatherdata %>%
+  filter(sourceId == "METSN97350:0")
+
+station_METSN88000 <- station_weatherdata %>%
+  filter(sourceId == "METSN88000:0") 
+
+station_METSN52290 <- station_weatherdata %>%
+  filter(sourceId == "METSN52290:0")
+
+station_METSN46510 <- station_weatherdata %>%
+  filter(sourceId == "METSN46510:0")
+
+station_METSN81680 <- station_weatherdata %>%
+  filter(sourceId == "METSN81680:0")
+
+station_METSN11500 <- station_weatherdata %>%
+  filter(sourceId == "METSN11500:0")
+
+station_METSN12550 <- station_weatherdata %>%
+  filter(sourceId == "METSN12550:0")
+
+station_METSN19710 <- station_weatherdata %>%
+  filter(sourceId == "METSN19710:0")
+
+station_METSN73500 <- station_weatherdata %>%
+  filter(sourceId == "METSN73500:0")
+
+# First, create a dataframe combining all selected stations
+test_station_weatherdata <- rbind(
+  station_METSN97350,
+  station_METSN88000,
+  station_METSN52290,
+  station_METSN46510,
+  station_METSN81680,
+  station_METSN11500, 
+  station_METSN12550,
+  station_METSN19710,
+  station_METSN73500
+  ) %>%
+  mutate(station_name = sourceId)
+# in station_weatherdata there are 2573 lines of data, in test_station_weatherdata there are 127
+# 127/2573 =  0.04935873 = 5% of the data is removed
+
+all_stations_sf <- station_weatherdata %>%
+  dplyr::select(sourceId, geometry) %>%
+  distinct() # 439 features
+
+heldout_sf <- test_station_weatherdata %>%
+  dplyr::select(sourceId, geometry) %>%
+  distinct() # 9 features
+
+dist_matrix <- st_distance(all_stations_sf, heldout_sf)
+within_50km <- apply(dist_matrix, 1, function(x) any(x <= 50))
+# sum(within_50km) # 93 features meaning 93 stations are within 50km of at least one test station (incl test stations)
+
+training_station_ids <- all_stations_sf$sourceId[!within_50km]
+# length(training_station_ids) # 346 features, 439 - 93 = 346 meaning 346 stations are used for training (not test stations or within 50km of them)
+
+training_station_weatherdata <- station_weatherdata %>%
+  filter(sourceId %in% training_station_ids) # all station NOT within 50km of test stations
+
+removed_data_ids <- all_stations_sf$sourceId[within_50km]
+# remove test stations from removed_data_ids
+removed_data_ids <- removed_data_ids[!(removed_data_ids %in% heldout_sf$sourceId)]
+# length(removed_data_ids) # 84 (84 + 9 + 346 = training + test + spatial dependent = 439 total features)
+
+removed_station_weatherdata <- station_weatherdata %>%
+  filter(sourceId %in% removed_data_ids)
+
+saveRDS(training_station_weatherdata, file = "AA/training_station_weatherdata_centered.rds")
+saveRDS(test_station_weatherdata, file = "AA/test_station_weatherdata_centered.rds")
+saveRDS(removed_station_weatherdata, file = "AA/removed_station_weatherdata_centered.rds")
+########################################################################
+# Covariate functions
+########################################################################
+
+# Elevation Covariate
+elevation <- function(stationdata){
+  elev <- elevation_30s(country = "Norway", mask=TRUE)
+
+  # Project data frame form to UTM 33N to get everything in km
+  elev <- project(elev, crs_km)
+
+  # Crop and mask to Norway
+  elev <- crop(elev, vect(bnd_nor))
+  elev <- mask(elev, vect(bnd_nor))
+
+  names(elev) <- "elev_km"
+
+  values(elev) <- values(elev) /1000
+
+  # Convert raster to data.frame for ggplot
+  elev_df <- as.data.frame(elev, xy = TRUE)
+
+  ggplot(elev_df) +
+      geom_point(
+        aes(x = x, y = y, color = elev_km),
+        size = 0.1
+      ) +
+      colsc_TG(elev_df$elev_km) +
+      geom_polygon(
+        data = bnd_nor_xy,
+        aes(x = X, y = Y, group = group),
+        # Only want border, not fill
+        fill = NA,   # the fill color
+        color = "black",      # optional border
+        linewidth = 0.6
+      ) + 
+    coord_equal(
+      xlim = range(elev_df$x, na.rm = TRUE),
+      ylim = range(elev_df$y, na.rm = TRUE),
+      expand = FALSE
+    ) +
+      scale_x_continuous(breaks = seq(-500, 1500, by = 200)) +
+      scale_y_continuous(breaks = seq(5000, 9000, by = 200)) +
+      theme_minimal() +
+      theme(
+        panel.grid.major = element_line(color = "grey80"),
+        panel.grid.minor = element_line(color = "grey90"),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_line(color = "black"),
+        
+        plot.title = element_text(size = 29),
+        axis.title = element_text(size = 19),
+        axis.text = element_text(size = 17),
+        legend.text = element_text(size = 17),
+        legend.title = element_text(size = 19)
+      ) +
+      ggtitle("Elevation (km)") +
+      labs(
+        color = "Elevation (km)",
+        x = "x (km)",
+        y = "y (km)"
+      )
+
+  # plot elevation vs station temperature
+  elev_at_stations <- terra::extract(elev, vect(stationdata))
+  comparison_elev_df <- data.frame(
+    station_TG = stationdata$TG,
+    elev_km = elev_at_stations$elev_km
+  )
+  p <- ggplot(comparison_elev_df, aes(x = elev_km, y = station_TG)) +
+    geom_point(color = "blue", size = 2) +
+    theme_minimal() +
+    labs(
+      title = "Station Temperature vs Elevation (15 January 2023)",
+      x = "Elevation (km)",
+      y = "Station Temperature (°C)"
+    ) +
+    # add legend to plot representing points "blue point are temperature at stations"
+    scale_x_continuous(breaks = seq(0, 3, by = 0.5)) +
+    scale_y_continuous(breaks = seq(-35, 10, by = 5)) +
+    theme(
+      panel.grid.major = element_line(color = "grey80"),
+      panel.grid.minor = element_line(color = "grey90"),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      
+      plot.title = element_text(size = 29),
+      axis.title = element_text(size = 29),
+      axis.text = element_text(size = 24),
+      legend.text = element_text(size = 24),
+      legend.title = element_text(size = 29)
+    ) +
+    # add line of best fit
+    geom_smooth(method = "lm", color = "red", se = FALSE)
+
+  print(p)
+
+  return(elev)
+}
+
+extract_water <- function(plotparts) {
+  europe <- ne_countries(continent = "Europe", scale = "medium", returnclass = "sf")
+  europe <- st_transform(europe, crs_km) # UTM zone 33N in km
+
+  # Define bounding box around Norway (buffer ~250 km)
+  nor_bbox <- st_buffer(st_union(bnd_nor), dist = 250, crs = crs_km)
+  nor_sur <- st_intersection(europe, nor_bbox)
+
+  # Create water areas by subtracting land from the study domain
+  water_areas <- st_difference(nor_bbox, st_union(nor_sur))
+  land_areas <- st_difference(nor_bbox, st_union(water_areas))
+  not_nor_land_areas <- st_difference(land_areas, st_union(bnd_nor))
+  nor_land_areas <- st_difference(land_areas, st_union(not_nor_land_areas))
+
+  # Buffer and debuffer to smooth out fjords
+  coastline_smoothed <- st_buffer(land_areas, 10) # buffer 10 km out from land_area
+  coastline_smoothed <- st_buffer(coastline_smoothed, -25) # de buffer inn again 25 km from buffer -> 15km innland
+
+  sea <- st_difference(water_areas, st_union(coastline_smoothed))
+  fjords <- st_difference(water_areas, st_union(sea))
+
+  if (plotparts == TRUE) {
+    # Plot to see all components clearly
+    plot(water_areas, col = "lightblue")
+    plot(land_areas, col = "grey", add = TRUE)
+    plot(not_nor_land_areas, col = "red", add = TRUE)
+    plot(nor_land_areas, col = "darkgreen", add = TRUE)
+    plot(sea, col = "darkblue", add = TRUE)
+    plot(fjords, col = "yellow", add = TRUE)
+  }
+  c(sea, fjords)
+}
+
+create_covariate <- function(raster, center, add_to_swd) {
+  name <- names(raster)
+
+  # crop and mask
+  raster <- crop(raster, bnd_nor)
+  raster <- mask(raster, bnd_nor)
+
+  if (add_to_swd == TRUE) {
+    # Extract values (returns data.frame with ID + value)
+    val <- terra::extract(raster, vect(station_weatherdata))
+
+    # Add to station_weatherdata
+    station_weatherdata[[name]] <<- as.numeric(val[[name]])
+  }
+
+  if (center == TRUE) {
+    # Extract values (returns data.frame with ID + value)
+    val <- terra::extract(raster, vect(station_weatherdata))
+
+    # Extract values at stations
+    station_weatherdata[[name]] <- as.numeric(val[[name]])
+    
+    # Center with mean of values at stations
+    val_mean <- mean(station_weatherdata[[name]], na.rm = TRUE)
+
+    if (add_to_swd == TRUE) {
+      # Add centered values to station_weatherdata
+      station_weatherdata[[paste0(name,"_centered")]] <<- station_weatherdata[[name]] - val_mean
+    }
+
+    # Create centered raster
+    raster_centered <- raster - val_mean
+    names(raster_centered) <- paste0(name,"_centered")
+
+    return(raster_centered)
+  } else {
+    return(raster)
+  }
+}
+
+distance_water_thing <- function(water_thing, name, plotparts, checks){
+  # Calculate distance to "water_thing"
+  namedistance_km <- paste0(name,"distance_km")
+
+  water_vect <- terra::vect(water_thing)  # preserves CRS from sf; requires same CRS
+
+  # Use elevation raster as template (same extent/resolution/projection)
+  template_r <- rast_elev_km_centered
+
+  # Create a raster where water cells are 1 and land cell are NA
+  water_raster <- rasterize(water_vect, template_r, field = 1, background = NA)
+
+  # Compute distance (terra::distance): distance to nearest non-NA cell (i.e., "water_thing")
+  dist_to_water_raster <- distance(water_raster)
+  names(dist_to_water_raster) <- namedistance_km
+
+  rast_waterdistance_km_centered <- create_covariate(dist_to_water_raster, center = TRUE, add_to_swd = TRUE)
+
+  if (plotparts == TRUE) {    
+    # transform to data frame for ggplot
+    waterdistance_km_centered <- as.data.frame(rast_waterdistance_km_centered, xy = TRUE)
+    names(waterdistance_km_centered)[3] <- "namedistance_km"
+    # plot rast_waterdistance_km_centered in same style as elevation plot
+    p <- ggplot() +
+      geom_raster(data = waterdistance_km_centered, aes(x = x, y = y, fill = namedistance_km)) +
+      colsc_TG_fill(waterdistance_km_centered$namedistance_km) +
+      geom_polygon(
+        data = bnd_nor_xy,
+        aes(x = X, y = Y, group = group),
+        # Only want border, not fill
+        fill = NA,   # the fill color
+        color = "black",      # optional border
+        linewidth = 0.6
+      ) + 
+      coord_equal(
+        xlim = range(bnd_nor_xy$X, na.rm = TRUE),
+        ylim = range(bnd_nor_xy$Y, na.rm = TRUE),
+        expand = FALSE
+      ) +
+      theme_minimal() +
+      theme(
+        panel.grid.major = element_line(color = "grey80"),
+        panel.grid.minor = element_line(color = "grey90"),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+      
+        plot.title = element_text(size = 29),
+        legend.text = element_text(size = 24),
+        legend.title = element_text(size = 29)
+      ) +
+      ggtitle(paste0("Distance to ", name)) +
+      labs(
+        fill = paste0("Distance (km)"),
+        x = "x (km)",
+        y = "y (km)"
+      )
+
+    if (name == "fjord") {
+        p <- p
+    } else {
+        p <- p + theme(legend.position = "none")
+    }
+
+    print(p)
+
+    #plot(water_raster)
+    #print(rast_waterdistance_km_centered)
+    #plot(rast_waterdistance_km_centered, main = paste0("Distance to ", name," (km)"))
+  }
+  if (checks == TRUE) {
+    # Quick cheks
+    summary(rast_waterdistance_km_centered)
+    hist(rast_waterdistance_km_centered, main = paste0("Distance to ", name," (km)"), xlab = "km")
+    summary(rast_waterdistance_km_centered)
+    summary(dist_to_water_raster)
+  }
+  return(rast_waterdistance_km_centered)
+}
+
+########################################################################
+# Covariates
+########################################################################
+rast_elevation <- elevation(station_weatherdata)
+saveRDS(rast_elevation, file = "AA/rast_elevation.rds")
+
+rast_tpi <- tpi(rast_elevation, scale = 7, win = "rectangle")
+names(rast_tpi) <- "tpi"
+rast_tpi_centered <- create_covariate(rast_tpi, center = TRUE, add_to_swd = FALSE)
+
+# Extract latitude in km
+rast_lat_km <- terra::init(rast_elevation, "y")   # each cell value = y coordinate (in CRS units)
+names(rast_lat_km) <- "lat_km"
+
+# Extract longitude in km
+rast_long_km <- terra::init(rast_elevation, "x")   # each cell value = x coordinate (in CRS units)
+names(rast_long_km) <- "long_km"
+
+rast_elev_km_centered <- create_covariate(rast_elevation, center = TRUE, add_to_swd = FALSE)
+rast_lat_km_centered <- create_covariate(rast_lat_km, center = TRUE, add_to_swd = FALSE)
+rast_long_km_centered <- create_covariate(rast_long_km, center = TRUE, add_to_swd = FALSE)
+
+# Create interaction term latitude x elevation
+rast_elevXlat_km <- rast_elev_km_centered * rast_lat_km_centered
+names(rast_elevXlat_km) <- "elevXlat_km"
+
+# Create interaction term longitude x elevation
+rast_elevXlong_km <- rast_elev_km_centered * rast_long_km_centered
+names(rast_elevXlong_km) <- "elevXlong_km"
+
+rast_elevXlat_km <- create_covariate(rast_elevXlat_km, center = FALSE, add_to_swd = FALSE)
+rast_elevXlong_km <- create_covariate(rast_elevXlong_km, center = FALSE, add_to_swd = FALSE)
+
+# Create interaction term latitude x longitude
+rast_latXlong_km <- rast_lat_km_centered * rast_long_km_centered
+names(rast_latXlong_km) <- "latXlong_km"
+rast_latXlong_km <- create_covariate(rast_latXlong_km, center = FALSE, add_to_swd = FALSE)
+
+water <- extract_water(plotparts = FALSE)
+sea <- water[1]
+fjord <- water[2]
+
+rast_waterdistance_km_centered <- distance_water_thing(water, "sea", plotparts = TRUE, checks = FALSE)
+rast_coastdistance_km_centered <- distance_water_thing(sea, "coast", plotparts = TRUE, checks = FALSE)
+rast_fjorddistance_km_centered <- distance_water_thing(fjord, "fjord", plotparts = TRUE, checks = FALSE)
+
+# Save covariates as .rds files for later use in model fitting
+saveRDS(rast_elev_km_centered, file = "AA/rast_elev_km_centered.rds")
+saveRDS(rast_lat_km_centered, file = "AA/rast_lat_km_centered.rds")
+saveRDS(rast_long_km_centered, file = "AA/rast_long_km_centered.rds")
+saveRDS(rast_elevXlat_km, file = "AA/rast_elevXlat_km.rds")
+saveRDS(rast_elevXlong_km, file = "AA/rast_elevXlong_km.rds")
+saveRDS(rast_latXlong_km, file = "AA/rast_latXlong_km.rds")
+saveRDS(rast_waterdistance_km_centered, file = "AA/rast_waterdistance_km_centered.rds")
+saveRDS(rast_coastdistance_km_centered, file = "AA/rast_coastdistance_km_centered.rds")
+saveRDS(rast_fjorddistance_km_centered, file = "AA/rast_fjorddistance_km_centered.rds")
+
+########################################################################
+# Check for spatial bias 
+########################################################################
+station_all <- NULL
+numerical_all <- NULL
+comparison_numerical_df <- NULL
+days <- c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31)
+weatherdata_days <- function(year, month){
+  c <- 0
+  
+  for (dd in days){
+    c <- c + 1
+    mm <- sprintf("%02d", month)
+    yyyy <- as.character(year)
+    dd <- sprintf("%02d", dd)
+    
+    # Load station data
+    station_data_dd <- station_data(yyyy, mm, dd)
+    
+    # Set time counter
+    station_data_dd$day <- dd
+    station_data_dd$time <- c
+    
+    if (is.null(station_all)) {
+      station_all <<- station_data_dd
+    } else {
+      station_all <<- rbind(station_all, station_data_dd)
+    }
+    
+    # Load numerical data
+    numerical_data_dd <- numerical_data(yyyy, mm, dd)
+    
+    # aggregate while still a raster
+    numerical_data_dd <- terra::aggregate(numerical_data_dd, fact = 10, fun = mean)
+  
+    numerical_data_df <- as.data.frame(numerical_data_dd, xy = TRUE)
+    numerical_data_df$day <- dd
+    numerical_data_df$time <- c
+    
+    # append rows
+    if (is.null(numerical_all)) {
+      numerical_all <<- numerical_data_df
+    } else {
+      numerical_all <<- rbind(numerical_all, numerical_data_df)
+      }
+
+    station_spatvect <- terra::vect(station_data_dd) # convert to spatvector
+    numerical_at_stations <- terra::extract(rast(numerical_data_df[,c("x","y","TG_num")]), station_spatvect)
+
+    comparison_numerical_df_dd <- data.frame(
+      station_TG = station_data_dd$TG,
+      numerical_TG = numerical_at_stations$TG_num,
+      sourceId = station_data_dd$sourceId,
+      day = station_data_dd$day
+    )
+
+    # append rows
+    if (is.null(comparison_numerical_df)) {
+      comparison_numerical_df <<- comparison_numerical_df_dd
+    } else {
+      comparison_numerical_df <<- rbind(comparison_numerical_df, comparison_numerical_df_dd)
+      }
+    }
+}
+weatherdata_days(2001, 1)
+
+saveRDS(station_all, file = "station_all_jan_days_2001.rds")
+saveRDS(numerical_all, file = "numerical_all_jan_days_2001.rds")
+saveRDS(comparison_numerical_df, file = "comparison_numerical_jan_days_2001.rds")
+
+station_all <- readRDS("AA/station_all_jan_days_2001.rds")
+numerical_all <- readRDS("AA/numerical_all_jan_days_2001.rds")
+comparison_numerical_df <- readRDS("AA/comparison_numerical_jan_days_2001.rds")
+
+# sort comparison_numerical_df by station_Id to check data
+comparison_numerical_df <- comparison_numerical_df %>%
+  arrange(sourceId)
+
+# Check distribution of station locations across Norway (north/south, high/low elevation)
+station_weatherdata <- station_all
+
+stations_north <- station_weatherdata %>%
+  filter(st_coordinates(.)[,2] > 7230)
+
+stations_south <- station_weatherdata %>%
+  filter(st_coordinates(.)[,2] < 7230)
+
+stations_high <- station_weatherdata %>%
+  filter(elev_km > 0.46)
+
+stations_low <- station_weatherdata %>%
+  filter(elev_km <= 0.46)
+```
+
+
+
+
