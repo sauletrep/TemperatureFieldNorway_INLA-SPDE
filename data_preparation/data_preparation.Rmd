@@ -102,6 +102,7 @@ bnd_nor_xy <- data.frame(
 )
 saveRDS(bnd_nor_xy, file = "AA/bnd_nor_xy.rds")
 bnd_nor_xy <- readRDS("AA/bnd_nor_xy.rds")
+
 ########################################################################
 # Functions for reading, downloading, and preparing numerical and station data
 ########################################################################
@@ -536,6 +537,7 @@ removed_station_weatherdata <- station_weatherdata %>%
 saveRDS(training_station_weatherdata, file = "AA/training_station_weatherdata_centered.rds")
 saveRDS(test_station_weatherdata, file = "AA/test_station_weatherdata_centered.rds")
 saveRDS(removed_station_weatherdata, file = "AA/removed_station_weatherdata_centered.rds")
+
 ########################################################################
 # Covariate functions
 ########################################################################
@@ -793,6 +795,7 @@ distance_water_thing <- function(water_thing, name, plotparts, checks){
 ########################################################################
 # Covariates
 ########################################################################
+
 rast_elevation <- elevation(station_weatherdata)
 saveRDS(rast_elevation, file = "AA/rast_elevation.rds")
 
@@ -850,6 +853,7 @@ saveRDS(rast_fjorddistance_km_centered, file = "AA/rast_fjorddistance_km_centere
 ########################################################################
 # Check for spatial bias 
 ########################################################################
+
 station_all <- NULL
 numerical_all <- NULL
 comparison_numerical_df <- NULL
@@ -940,7 +944,3 @@ stations_high <- station_weatherdata %>%
 stations_low <- station_weatherdata %>%
   filter(elev_km <= 0.46)
 ```
-
-
-
-
