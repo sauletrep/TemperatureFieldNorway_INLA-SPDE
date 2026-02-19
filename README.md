@@ -19,6 +19,6 @@ A substantial part of the project is devoted to data preparation and preprocessi
 
 Most plots were created using `ggplot2` following consistent plotting principles, with only minor variations depending on the data type. To avoid redundancy, not all plotting scripts are included. The plots that are directly relevant to the thesis results can be found in: [`plots/`](./plots)
 
-The core model implementation, including mesh construction, SPDE specification, and INLA model fitting, is located in: [`models/`](./models)
+The core model implementation, including mesh construction, SPDE specification, INLA model fitting, and Cross-Validation, is located in: [`models/`](./models)
 
 The final fitted models used to produce the thesis results are stored in: [`final_models/`](./final_models)
