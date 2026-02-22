@@ -372,7 +372,7 @@ fusion_predict_training <- readRDS("AA/fusion_predict_training_final.rds")
 fusion_bias <- readRDS("AA/fusion_bias_final.rds")
 
 ########################################################################
-# Cross validation study
+# Cross validation study (k-fold)
 ########################################################################
 
 lgocv_calculation <- function(fit_model){
@@ -462,7 +462,7 @@ saveRDS(results, file = "results_CV_ALL.rds")
 results <- readRDS("results_CV_ALL.rds")
 
 ########################################################################
-# Manual Spatial Hold-Out Scheme 
+# Manual Spatial Hold-Out Scheme (1-fold LGOCV)
 ########################################################################
 
 # true values at station locations in test_station_weatherdata
