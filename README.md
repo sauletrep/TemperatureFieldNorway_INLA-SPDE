@@ -1,6 +1,6 @@
-# A Bayesian Data Fusion Model of Temperature in Norway Using the INLA-SPDE Method
+# A Bayesian Data Fusion Model for Temperature in Norway Using the INLA-SPDE Method
 
-This repository contains the R code developed for the master’s thesis **_A Bayesian Data Fusion Model of Temperature in Norway Using the INLA-SPDE Method_**.
+This repository contains the R code developed for the master’s thesis **_A Bayesian Data Fusion Model for Temperature in Norway Using the INLA-SPDE Method_**.
 
 It includes:
 - The full code used to build and estimate the final models  
