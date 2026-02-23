@@ -11,7 +11,9 @@ A link to the published thesis will be added here once it becomes available: [Li
 
 # Abstract
 
-Meteorological data in Norway comes from both weather stations and numerical models. Each of these data sources have their own limitations: spatial coverage of observations are often sparse, while forecasts can be biased. To improve the quality of temperature information in Norway, it may be useful to combine these data sources within a single statistical model. This thesis explores a Bayesian data fusion approach using the INLA–SPDE method. The numerical forecast dataset is derived from NORA3, a downscaling of ERA5, while the observations of daily mean temperature come from Frost API, MET Norway’s archive of historical weather and climate data.
+Meteorological data in Norway comes from both weather stations and numerical reanalysis models. Each of these data sources have their own limitations: spatial coverage of observations is often sparse, while forecasts can be biased. To improve the quality and reliability of spatial temperature information in Norway, it may be useful to combine these data sources within a single statistical model. 
+
+This thesis explores a Bayesian data fusion approach based on the INLA–SPDE methodology. The numerical forecast dataset is derived from NORA3, a downscaling of ERA5, while the observations of daily mean temperature are obtained from the Frost API, which provides access to the Norwegian Meteorological Institute's archive of historical weather and climate data.
 
 # About this repository
 
